@@ -1,17 +1,20 @@
 # Gridville
 
-Gridville is an original, browser-based educational optimization game about placing and dispatching home batteries in a fictional Texas neighborhood. Players build a virtual power plant by hand, then compare their profit with a mixed-integer optimization model solved locally by [HiGHS](https://highs.dev/) through the MIT-licensed `highs-js` WebAssembly package.
+Gridville is an original, browser-based optimization strategy game about running home batteries in a fictional Texas neighborhood. Players build a virtual power plant by hand, paint its dispatch directly onto the market curve, play the day forward, then face a mixed-integer benchmark solved locally by [HiGHS](https://highs.dev/) through the MIT-licensed `highs-js` WebAssembly package.
 
-![Gridville start screen](docs/gridville-home.png)
+![Gridville campaign launch screen](docs/screenshots/after-landing.png)
 
 ## How to play
 
-1. Pick candidate homes on the neighborhood map. Each installation has different capacity, power, efficiency, and cost.
-2. Paint a 24-hour schedule for every battery, or start with **Buy low / sell high** and adjust it.
-3. Lock the day. HiGHS finds the mathematical benchmark and reveals its chosen sites and dispatch.
-4. In Round 2, both plans are made from a forecast and settled against the same surprise actual prices.
+1. Pick glowing homes directly on the animated neighborhood map.
+2. Drag charge, hold, and discharge regions across the 24-hour price curve.
+3. Scrub or play the day to watch sunlight, state of charge, and electricity flows change together.
+4. Lock the day. HiGHS sweeps its benchmark plan onto the town and awards an S–D grade.
+5. Progress through nine scenario days covering spreads, fleet economics, physics losses, forecast risk, ERCOT-style zonal markets, demand response, and a full VPP boss.
 
-Every battery starts and ends the day empty. Profit includes electricity sales and purchases, fixed installation costs, and wear per kWh of battery throughput. A match code deterministically fixes all six days for classroom competition; no account or server is involved.
+Every battery starts and ends the day empty. Profit includes electricity sales and purchases, fixed installation costs, wear per kWh of battery throughput, and explicitly modeled event credits. A match code deterministically fixes all nine days for classroom competition; no account or server is involved.
+
+Campaign content lives in the manifest in `src/data.ts`. Chapters 1–3 are tagged `free`; later chapters are tagged `premium` but remain unlocked by the founders-preview flag. There is no payment code. See [the content-tier seam](docs/monetization.md).
 
 ## Run locally
 

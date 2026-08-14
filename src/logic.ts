@@ -1,4 +1,4 @@
-import type { Action, DayData, Evaluation, PlayerPlan, Site, SiteEvaluation } from './types';
+import type { Action, DayData, DemandResponseEvent, Evaluation, Grade, PlayerPlan, Site, SiteEvaluation, SolverResult } from './types';
 
 export const HOURS = Array.from({ length: 24 }, (_, index) => index);
 
@@ -32,8 +32,13 @@ export function makeSmartPreset(site: Site, prices: number[]): Action[] {
   return actions;
 }
 
-export function evaluateSite(site: Site, actions: Action[], prices: number[], degradationCost: number, installed = true): SiteEvaluation {
-  if (!installed) return { siteId: site.id, flows: HOURS.map(() => ({ charge: 0, discharge: 0, soc: 0 })), energyRevenue: 0, energyCost: 0, degradation: 0, installCost: 0, profit: 0, feasible: true };
+export function pricesForSite(day: DayData, site: Site, basePrices = day.prices): number[] {
+  const adjustment = site.zone ? day.zonePriceAdjustments?.[site.zone] : undefined;
+  return basePrices.map((price, hour) => price + (adjustment?.[hour] ?? 0));
+}
+
+export function evaluateSite(site: Site, actions: Action[], prices: number[], degradationCost: number, installed = true, demandResponse?: DemandResponseEvent): SiteEvaluation {
+  if (!installed) return { siteId: site.id, flows: HOURS.map(() => ({ charge: 0, discharge: 0, soc: 0 })), energyRevenue: 0, reserveRevenue: 0, energyCost: 0, degradation: 0, installCost: 0, profit: 0, feasible: true };
   const eta = Math.sqrt(site.efficiency);
   let soc = 0;
   let energyRevenue = 0;
@@ -55,21 +60,69 @@ export function evaluateSite(site: Site, actions: Action[], prices: number[], de
     degradation += (charge + discharge) * degradationCost;
     return { charge, discharge, soc };
   });
+  const reserveRevenue = demandResponse ? (flows[demandResponse.hour]?.soc ?? 0) * demandResponse.rewardPerStoredKWh : 0;
   const installCost = site.installCost;
-  const profit = energyRevenue - energyCost - degradation - installCost;
-  return { siteId: site.id, flows, energyRevenue, energyCost, degradation, installCost, profit, feasible: soc <= 0.01 };
+  const profit = energyRevenue + reserveRevenue - energyCost - degradation - installCost;
+  return { siteId: site.id, flows, energyRevenue, reserveRevenue, energyCost, degradation, installCost, profit, feasible: soc <= 0.01 };
 }
 
 export function evaluatePlan(day: DayData, plan: PlayerPlan, prices = day.prices): Evaluation {
-  const sites = day.sites.map((site) => evaluateSite(site, plan[site.id]?.actions ?? Array(24).fill(0), prices, day.degradationCost, plan[site.id]?.installed ?? false));
+  const sites = day.sites.map((site) => evaluateSite(site, plan[site.id]?.actions ?? Array(24).fill(0), pricesForSite(day, site, prices), day.degradationCost, plan[site.id]?.installed ?? false, day.demandResponse));
   const totals = sites.reduce((sum, site) => ({
     revenue: sum.revenue + site.energyRevenue,
+    reserveRevenue: sum.reserveRevenue + site.reserveRevenue,
     energyCost: sum.energyCost + site.energyCost,
     installCost: sum.installCost + site.installCost,
     degradation: sum.degradation + site.degradation,
     profit: sum.profit + site.profit,
-  }), { revenue: 0, energyCost: 0, installCost: 0, degradation: 0, profit: 0 });
+  }), { revenue: 0, reserveRevenue: 0, energyCost: 0, installCost: 0, degradation: 0, profit: 0 });
   return { ...totals, sites, feasible: sites.every((site) => site.feasible) };
+}
+
+export function performancePercent(player: number, optimal: number): number {
+  if (optimal <= 0) return player >= optimal ? 100 : 0;
+  return Math.max(0, Math.round((player / optimal) * 100));
+}
+
+export function gradeForPercent(percent: number): Grade {
+  if (percent >= 98) return 'S';
+  if (percent >= 90) return 'A';
+  if (percent >= 75) return 'B';
+  if (percent >= 60) return 'C';
+  return 'D';
+}
+
+export function medalForGrade(grade: Grade): 'gold' | 'silver' | 'bronze' | 'none' {
+  if (grade === 'S') return 'gold';
+  if (grade === 'A') return 'silver';
+  if (grade === 'B') return 'bronze';
+  return 'none';
+}
+
+export function dispatchSuggestion(day: DayData, plan: PlayerPlan, solver: SolverResult): string {
+  const installed = day.sites.filter((site) => plan[site.id]?.installed);
+  const evaluation = evaluatePlan(day, plan);
+  const peakHour = day.prices.indexOf(Math.max(...day.prices));
+  const underfilled = installed.find((site) => {
+    const result = evaluation.sites.find((entry) => entry.siteId === site.id);
+    const fullest = Math.max(0, ...(result?.flows.slice(0, peakHour + 1).map((flow) => flow.soc) ?? []));
+    return fullest < site.capacity - 0.25;
+  });
+  if (underfilled) {
+    const result = evaluation.sites.find((entry) => entry.siteId === underfilled.id)!;
+    const fullest = Math.max(...result.flows.map((flow) => flow.soc));
+    return `${underfilled.name} reached only ${fullest.toFixed(1)} of ${underfilled.capacity} kWh before the peak. Paint one more cheap charge hour; it stops automatically at full.`;
+  }
+  const sleeper = installed.find((site) => plan[site.id].actions[peakHour] !== 1);
+  if (sleeper) return `${sleeper.name} slept through the ${hourLabel(peakHour)} spike. Try saving a little charge for it.`;
+  const missed = solver.plans.find((site) => site.installed && !plan[site.siteId]?.installed);
+  if (missed) {
+    const site = day.sites.find((candidate) => candidate.id === missed.siteId);
+    if (site) return `The solver recruited ${site.name}. Its capacity-to-install-cost ratio earned the call-up.`;
+  }
+  const costlyCharge = installed.flatMap((site) => plan[site.id].actions.map((action, hour) => ({ site, action, hour }))).find(({ action, hour }) => action === -1 && day.prices[hour] > day.prices.reduce((sum, price) => sum + price, 0) / 24);
+  if (costlyCharge) return `${costlyCharge.site.name} bought energy at ${hourLabel(costlyCharge.hour)} above the day's average. Hunt for a cheaper valley.`;
+  return 'Your timing was sharp. Next run, test whether one fewer installation preserves the same spread profit.';
 }
 
 export function formatSpark(value: number): string {
