@@ -1,190 +1,390 @@
-import { useMemo, useState } from 'react';
-import { ArrowDown, ArrowRight, ArrowUp, BatteryCharging, BookOpen, Check, ChevronRight, CircleDollarSign, CloudSun, Download, Gauge, House, Info, Lightbulb, LoaderCircle, MapPin, RotateCcw, Sparkles, Trophy, Users, X } from 'lucide-react';
-import { buildSequence, realizePrices } from './data';
-import { emptyPlan, evaluatePlan, formatSpark, hourLabel, makeSmartPreset } from './logic';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
+import { ArrowDown, ArrowRight, ArrowUp, BatteryCharging, BookOpen, Check, ChevronRight, CircleDollarSign, CloudLightning, CloudSun, FastForward, Gauge, House, Lightbulb, LoaderCircle, LockKeyhole, Medal, Play, RotateCcw, Sparkles, Square, Trophy, Users, Volume2, VolumeX, WandSparkles, X, Zap } from 'lucide-react';
+import { buildSequence, CAMPAIGN_MANIFEST, FOUNDERS_PREVIEW, isChapterAvailable, realizePrices } from './data';
+import { dispatchSuggestion, emptyPlan, evaluatePlan, formatSpark, gradeForPercent, hourLabel, makeSmartPreset, medalForGrade, performancePercent, pricesForSite } from './logic';
 import { evaluateOptimalOnPrices, solveDay } from './solver';
-import type { Action, DayData, PlayerPlan, SolverResult } from './types';
+import type { Action, ChapterManifest, DayData, Grade, PlayerPlan, Site, SolverResult } from './types';
 
-type Screen = 'welcome' | 'game' | 'result' | 'learn' | 'summary';
-type Score = { day: DayData; player: number; optimal: number };
+type Screen = 'welcome' | 'game' | 'result' | 'chapter' | 'field-guide' | 'summary';
+type Score = { day: DayData; player: number; optimal: number; percent: number; grade: Grade; best: number };
+type Sfx = 'click' | 'place' | 'paint' | 'lock' | 'cash' | 'fanfare' | 'thud';
 
-const ACTION_META: Record<Action, { label: string; icon: typeof ArrowDown }> = {
-  [-1]: { label: 'Charge', icon: ArrowDown },
-  [0]: { label: 'Idle', icon: X },
-  [1]: { label: 'Discharge', icon: ArrowUp },
-};
+const HOURS = Array.from({ length: 24 }, (_, hour) => hour);
 
-function PriceChart({ forecast, actual, uncertainty, compact = false }: { forecast: number[]; actual?: number[]; uncertainty?: number[]; compact?: boolean }) {
-  const width = 720;
-  const height = compact ? 145 : 205;
-  const pad = { top: 18, right: 15, bottom: 28, left: 42 };
-  const all = [...forecast, ...(actual ?? []), ...(uncertainty ? forecast.map((p, i) => p + uncertainty[i]) : []), ...(uncertainty ? forecast.map((p, i) => p - uncertainty[i]) : [])];
-  const min = Math.min(-5, ...all);
-  const max = Math.max(10, ...all);
-  const x = (i: number) => pad.left + (i / 23) * (width - pad.left - pad.right);
-  const y = (value: number) => pad.top + ((max - value) / (max - min)) * (height - pad.top - pad.bottom);
-  const line = (values: number[]) => values.map((value, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(value).toFixed(1)}`).join(' ');
-  const band = uncertainty ? `${forecast.map((value, i) => `${i ? 'L' : 'M'}${x(i)},${y(value + uncertainty[i])}`).join(' ')} ${[...forecast].reverse().map((value, reverseIndex) => { const i = 23 - reverseIndex; return `L${x(i)},${y(value - uncertainty[i])}`; }).join(' ')} Z` : '';
-  return <div className="chart-wrap">
-    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Hourly grid price chart">
-      <defs><linearGradient id="price-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#c9ff70" stopOpacity=".28"/><stop offset="1" stopColor="#c9ff70" stopOpacity="0"/></linearGradient></defs>
-      {[min, (min + max) / 2, max].map((tick) => <g key={tick}><line x1={pad.left} x2={width - pad.right} y1={y(tick)} y2={y(tick)} className="gridline"/><text x={pad.left - 8} y={y(tick) + 4} textAnchor="end" className="axis-label">{Math.round(tick)}</text></g>)}
-      {min < 0 && <line x1={pad.left} x2={width - pad.right} y1={y(0)} y2={y(0)} className="zero-line"/>}
-      {band && <path d={band} className="error-band"/>}
-      <path d={`${line(forecast)} L${x(23)},${y(min)} L${x(0)},${y(min)} Z`} fill="url(#price-fill)"/>
-      <path d={line(forecast)} className="forecast-line"/>
-      {actual && <path d={line(actual)} className="actual-line"/>}
-      {[0, 6, 12, 18, 23].map((hour) => <text key={hour} x={x(hour)} y={height - 7} textAnchor={hour === 0 ? 'start' : hour === 23 ? 'end' : 'middle'} className="axis-label">{hourLabel(hour)}</text>)}
-    </svg>
-    <div className="chart-legend"><span><i className="legend-dot forecast"/>Forecast</span>{actual && <span><i className="legend-dot actual"/>Actual</span>}{uncertainty?.some(Boolean) && <span><i className="legend-band"/>Possible range</span>}<b>₷ / kWh</b></div>
+function chapterFor(day: DayData): ChapterManifest {
+  return CAMPAIGN_MANIFEST.find((chapter) => chapter.id === day.chapterId) ?? CAMPAIGN_MANIFEST[0];
+}
+
+function useSynth(muted: boolean) {
+  const context = useRef<AudioContext>();
+  return useCallback((kind: Sfx) => {
+    if (muted) return;
+    const AudioContextClass = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    context.current ??= new AudioContextClass();
+    const audio = context.current;
+    const now = audio.currentTime;
+    const notes: Record<Sfx, Array<[number, number, number, OscillatorType]>> = {
+      click: [[360, .035, .025, 'square']],
+      paint: [[240, .035, .018, 'sine']],
+      place: [[180, .08, .07, 'sawtooth'], [520, .16, .055, 'sine'], [880, .22, .035, 'sine']],
+      lock: [[130, .2, .08, 'sawtooth'], [260, .32, .07, 'square']],
+      cash: [[660, .09, .05, 'sine'], [880, .16, .055, 'sine'], [1100, .24, .04, 'sine']],
+      fanfare: [[392, .18, .055, 'triangle'], [523, .32, .06, 'triangle'], [659, .48, .065, 'triangle'], [784, .7, .06, 'triangle']],
+      thud: [[92, .28, .1, 'sine']],
+    };
+    notes[kind].forEach(([frequency, delay, volume, type], index) => {
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      oscillator.type = type;
+      oscillator.frequency.setValueAtTime(frequency, now + index * delay * .7);
+      if (kind === 'place' || kind === 'lock') oscillator.frequency.exponentialRampToValueAtTime(frequency * 1.8, now + index * delay * .7 + delay);
+      gain.gain.setValueAtTime(0.0001, now + index * delay * .7);
+      gain.gain.exponentialRampToValueAtTime(volume, now + index * delay * .7 + .008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + index * delay * .7 + Math.max(.06, delay));
+      oscillator.connect(gain).connect(audio.destination);
+      oscillator.start(now + index * delay * .7);
+      oscillator.stop(now + index * delay * .7 + Math.max(.08, delay) + .03);
+    });
+  }, [muted]);
+}
+
+function AnimatedNumber({ value, duration = 900 }: { value: number; duration?: number }) {
+  const [shown, setShown] = useState(0);
+  useEffect(() => {
+    const started = performance.now();
+    let frame = 0;
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - started) / duration);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setShown(value * eased);
+      if (progress < 1) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [duration, value]);
+  return <>{formatSpark(shown)}</>;
+}
+
+function CampaignRail({ active }: { active: number }) {
+  return <div className="campaign-rail" aria-label="Campaign progress">
+    {CAMPAIGN_MANIFEST.map((chapter) => <div key={chapter.id} className={`rail-stop ${chapter.number < active ? 'complete' : ''} ${chapter.number === active ? 'active' : ''}`} title={`${chapter.number}. ${chapter.title}: ${chapter.concept}`}>
+      <span style={{ '--chapter-color': chapter.color } as CSSProperties}>{chapter.number < active ? <Check/> : chapter.number}</span><small>{chapter.shortTitle}</small>
+    </div>)}
   </div>;
 }
 
-function NeighborhoodMap({ day, plan, selectedId, onSelect, onToggle }: { day: DayData; plan: PlayerPlan; selectedId?: string; onSelect: (id: string) => void; onToggle: (id: string) => void }) {
-  return <div className="map-shell">
-    <svg className="map" viewBox="0 0 104 106" role="img" aria-label="Candidate home map">
-      <defs><pattern id="dots" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".25" fill="#d5d4c7"/></pattern></defs>
-      <rect width="104" height="106" rx="3" fill="#f4f1e5"/><rect width="104" height="106" rx="3" fill="url(#dots)"/>
-      <path className="road" d="M-4 43 C18 39 26 49 46 44 S77 34 108 42 M-4 82 C24 75 41 84 59 79 S88 67 108 73 M43 -4 C38 19 48 28 44 49 S36 78 43 110"/>
-      <path className="road-center" d="M-4 43 C18 39 26 49 46 44 S77 34 108 42 M-4 82 C24 75 41 84 59 79 S88 67 108 73 M43 -4 C38 19 48 28 44 49 S36 78 43 110"/>
-      <path d="M2 7H36V34H2zM51 5h49v25H51zM4 53h29v20H4zM51 51h49v14H51zM2 89h32v13H2zM50 87h50v15H50z" className="block"/>
+function PricePainter({ day, site, actions, flows, tool, scrubHour, disabled, onPaint }: { day: DayData; site: Site; actions: Action[]; flows: { soc: number }[]; tool: Action; scrubHour: number; disabled: boolean; onPaint: (hour: number, action: Action) => void }) {
+  const width = 620;
+  const height = 260;
+  const pad = { top: 23, right: 12, bottom: 34, left: 42 };
+  const prices = pricesForSite(day, site);
+  const all = [...prices, ...prices.map((price, hour) => price + day.uncertainty[hour]), ...prices.map((price, hour) => price - day.uncertainty[hour])];
+  const min = Math.min(-30, ...all);
+  const max = Math.max(50, ...all);
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const x = (hour: number) => pad.left + (hour / 23) * plotWidth;
+  const cellX = (hour: number) => pad.left + (hour / 24) * plotWidth;
+  const y = (value: number) => pad.top + ((max - value) / (max - min)) * plotHeight;
+  const line = prices.map((price, hour) => `${hour ? 'L' : 'M'}${x(hour).toFixed(1)},${y(price).toFixed(1)}`).join(' ');
+  const band = day.uncertainty.some(Boolean) ? `${prices.map((price, hour) => `${hour ? 'L' : 'M'}${x(hour)},${y(price + day.uncertainty[hour])}`).join(' ')} ${[...prices].reverse().map((price, reverseIndex) => { const hour = 23 - reverseIndex; return `L${x(hour)},${y(price - day.uncertainty[hour])}`; }).join(' ')} Z` : '';
+  const dragging = useRef(false);
+  const lastHour = useRef(-1);
+  const [hoverHour, setHoverHour] = useState<number>();
+  const hourAt = (event: ReactPointerEvent<SVGSVGElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return Math.max(0, Math.min(23, Math.floor(((event.clientX - rect.left) / rect.width * width - pad.left) / plotWidth * 24)));
+  };
+  const apply = (event: ReactPointerEvent<SVGSVGElement>) => {
+    const hour = hourAt(event);
+    setHoverHour(hour);
+    if (disabled || hour === lastHour.current) return;
+    lastHour.current = hour;
+    onPaint(hour, tool);
+  };
+  return <div className={`price-painter ${disabled ? 'disabled' : ''}`}>
+    <svg viewBox={`0 0 ${width} ${height}`} role="application" aria-label="Paint battery charge and discharge regions directly on the hourly price curve"
+      onPointerDown={(event) => { if (disabled) return; dragging.current = true; lastHour.current = -1; apply(event); try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* Synthetic QA events have no active pointer to capture. */ } }}
+      onPointerMove={(event) => { setHoverHour(hourAt(event)); if (dragging.current) apply(event); }}
+      onPointerUp={(event) => { dragging.current = false; lastHour.current = -1; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}
+      onPointerLeave={() => { if (!dragging.current) setHoverHour(undefined); }}>
+      <defs>
+        <linearGradient id="curveGlow" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#d7ff63" stopOpacity=".22"/><stop offset="1" stopColor="#d7ff63" stopOpacity="0"/></linearGradient>
+        <filter id="softGlow"><feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>
+      {[min, 0, max].map((tick) => <g key={tick}><line className={tick === 0 ? 'chart-zero' : 'chart-grid'} x1={pad.left} x2={width - pad.right} y1={y(tick)} y2={y(tick)}/><text className="chart-axis" x={pad.left - 8} y={y(tick) + 4} textAnchor="end">{Math.round(tick)}</text></g>)}
+      {HOURS.map((hour) => <rect key={hour} x={cellX(hour)} y={pad.top} width={plotWidth / 24 + .5} height={plotHeight} className={`paint-block action-${actions[hour]}`}><title>{hourLabel(hour)} · {prices[hour].toFixed(1)} sparks/kWh · {actions[hour] === -1 ? 'charging' : actions[hour] === 1 ? 'discharging' : 'idle'} · SOC {flows[hour]?.soc.toFixed(1) ?? 0} kWh</title></rect>)}
+      {band && <path d={band} className="uncertainty-band"/>}
+      <path d={`${line} L${x(23)},${y(min)} L${x(0)},${y(min)} Z`} fill="url(#curveGlow)"/>
+      <path d={line} className="price-line" filter="url(#softGlow)"/>
+      {day.demandResponse && <g className="event-marker"><line x1={cellX(day.demandResponse.hour) + plotWidth / 48} x2={cellX(day.demandResponse.hour) + plotWidth / 48} y1={pad.top} y2={height - pad.bottom}/><text x={cellX(day.demandResponse.hour) + plotWidth / 48} y={pad.top + 11} textAnchor="middle">FLEX</text></g>}
+      <line className="time-sweep" x1={cellX(scrubHour) + plotWidth / 48} x2={cellX(scrubHour) + plotWidth / 48} y1={pad.top - 5} y2={height - pad.bottom + 5}/>
+      {hoverHour !== undefined && <g className="hover-pin"><circle cx={x(hoverHour)} cy={y(prices[hoverHour])} r="6"/><text x={Math.min(width - 72, Math.max(72, x(hoverHour)))} y={Math.max(18, y(prices[hoverHour]) - 14)} textAnchor="middle">{hourLabel(hoverHour)} · ₷{prices[hoverHour].toFixed(1)}</text></g>}
+      {[0, 6, 12, 18, 23].map((hour) => <text key={hour} className="chart-axis" x={x(hour)} y={height - 9} textAnchor={hour === 0 ? 'start' : hour === 23 ? 'end' : 'middle'}>{hourLabel(hour)}</text>)}
+    </svg>
+    {disabled && <div className="chart-curtain"><House/><b>Choose a glowing home</b><span>The market is live. Place a battery to paint its dispatch.</span></div>}
+  </div>;
+}
+
+function TownScene({ day, plan, selectedId, hour, onSite }: { day: DayData; plan: PlayerPlan; selectedId: string; hour: number; onSite: (id: string) => void }) {
+  const evaluation = evaluatePlan(day, plan);
+  const daylight = hour >= 6 && hour < 19;
+  const sunX = 90 + (hour / 23) * 1020;
+  const sunY = 175 - Math.sin((hour / 23) * Math.PI) * 120;
+  const point = (site: Site) => ({ x: 250 + site.x * 7.2, y: 250 + site.y * 3.3 });
+  return <div className={`town-scene ${daylight ? 'daylight' : 'nighttime'}`} style={{ '--time': `${hour / 23}` } as CSSProperties}>
+    <svg viewBox="0 0 1200 690" preserveAspectRatio="xMidYMid slice" role="img" aria-label={`Animated Gridville neighborhood at ${hourLabel(hour)}`}>
+      <defs>
+        <linearGradient id="skyDay" x1="0" y1="0" x2="0" y2="1"><stop stopColor={daylight ? '#59b9e9' : '#101a3c'}/><stop offset=".62" stopColor={daylight ? '#bce8e2' : '#2b315d'}/><stop offset="1" stopColor={daylight ? '#f7d98d' : '#4c3f62'}/></linearGradient>
+        <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#66a86b"/><stop offset="1" stopColor="#254f45"/></linearGradient>
+        <filter id="houseGlow"><feDropShadow dx="0" dy="0" stdDeviation="7" floodColor="#d7ff63" floodOpacity=".9"/></filter>
+        <filter id="sparkGlow"><feGaussianBlur stdDeviation="2"/></filter>
+        <pattern id="roadDash" width="48" height="8" patternUnits="userSpaceOnUse"><rect width="24" height="3" fill="#f7df9c" opacity=".6"/></pattern>
+      </defs>
+      <rect width="1200" height="690" fill="url(#skyDay)"/>
+      <g className="stars">{Array.from({ length: 26 }, (_, index) => <circle key={index} cx={(index * 83 + 47) % 1170} cy={(index * 47 + 31) % 215} r={index % 4 === 0 ? 2 : 1}/>)}</g>
+      <circle className="sun" cx={sunX} cy={sunY} r="43"/>
+      <g className="cloud cloud-one"><ellipse cx="190" cy="106" rx="63" ry="19"/><circle cx="164" cy="93" r="25"/><circle cx="205" cy="87" r="34"/></g>
+      <g className="cloud cloud-two"><ellipse cx="870" cy="145" rx="74" ry="20"/><circle cx="840" cy="127" r="28"/><circle cx="890" cy="119" r="37"/></g>
+      <path d="M0 275 Q165 176 325 264 T650 243 T950 261 T1200 211 V430 H0Z" className="far-hills"/>
+      <path d="M0 337 Q172 245 350 337 T701 319 T1020 318 T1200 275 V690 H0Z" fill="url(#ground)"/>
+      <path d="M-80 520 C170 435 390 470 606 535 S1010 575 1280 460" className="road-edge"/>
+      <path d="M-80 520 C170 435 390 470 606 535 S1010 575 1280 460" className="road"/>
+      <path d="M-80 520 C170 435 390 470 606 535 S1010 575 1280 460" className="road-dashes"/>
+      <path d="M405 690 C414 573 476 478 511 350" className="road-edge side"/>
+      <path d="M405 690 C414 573 476 478 511 350" className="road side"/>
+      <g className="windmill" transform="translate(1030 245)"><path d="M0 0V155"/><circle r="9"/><path d="M0 0L-49 -18M0 0L9 52M0 0L39 -35"/></g>
+      <g className="water-tower" transform="translate(965 325)"><ellipse cx="0" cy="0" rx="38" ry="20"/><path d="M-35 0Q-31 55 0 61Q31 55 35 0M-20 55L-29 137M20 55L29 137M-26 111H26"/><text x="0" y="6" textAnchor="middle">GRIDVILLE</text></g>
       {day.sites.map((site) => {
+        const p = point(site);
         const installed = plan[site.id]?.installed;
         const selected = selectedId === site.id;
-        return <g key={site.id} className={`home-marker ${installed ? 'installed' : ''} ${selected ? 'selected' : ''}`} role="button" tabIndex={0} aria-label={`${site.name}, ${installed ? 'battery installed' : 'candidate site'}`} onClick={() => { onSelect(site.id); onToggle(site.id); }} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(site.id); onToggle(site.id); } }}>
-          <circle cx={site.x} cy={site.y} r={selected ? 5.7 : 5} className="marker-halo"/>
-          <path d={`M${site.x - 3.8} ${site.y} L${site.x} ${site.y - 3.1} L${site.x + 3.8} ${site.y} V${site.y + 3.6} H${site.x - 3.8}Z`} fill={installed ? site.color : '#fffdf4'} className="house-shape"/>
-          {installed && <path d={`M${site.x - 1.2} ${site.y + .2}h2.4v2.2h-2.4z`} className="battery-window"/>}
+        const siteEval = evaluation.sites.find((entry) => entry.siteId === site.id)!;
+        const flow = siteEval.flows[hour] ?? { charge: 0, discharge: 0, soc: 0 };
+        const activePower = Math.max(flow.charge, flow.discharge);
+        const direction = flow.discharge > .01 ? 'out' : flow.charge > .01 ? 'in' : 'idle';
+        const toGrid = `M${p.x} ${p.y - 20} Q${(p.x + 915) / 2} ${p.y - 110} 915 410`;
+        const fromGrid = `M915 410 Q${(p.x + 915) / 2} ${p.y - 110} ${p.x} ${p.y - 20}`;
+        return <g key={site.id}>
+          {installed && direction !== 'idle' && <g className={`energy-flow ${direction}`}>
+            <path d={direction === 'out' ? toGrid : fromGrid}/>
+            {Array.from({ length: Math.max(1, Math.min(4, Math.ceil(activePower / 1.5))) }, (_, index) => <circle key={`${hour}-${index}`} r={3 + activePower / 5}><animateMotion dur={`${Math.max(.55, 1.55 - activePower / 8)}s`} begin={`${index * -.31}s`} repeatCount="indefinite" path={direction === 'out' ? toGrid : fromGrid}/></circle>)}
+          </g>}
+          <g className={`town-home ${installed ? 'installed' : ''} ${selected ? 'selected' : ''}`} transform={`translate(${p.x} ${p.y})`} role="button" tabIndex={0} aria-label={`${site.name}, ${site.zone} zone, ${installed ? 'battery installed' : 'candidate battery site'}`} onClick={() => onSite(site.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSite(site.id); } }}>
+            <ellipse className="home-shadow" cy="25" rx="43" ry="11"/>
+            <path className="home-body" d="M-34 -8L0 -36L34 -8V28H-34Z" style={{ fill: installed ? site.color : '#f9e9c8' }}/>
+            <path className="home-roof" d="M-41 -6L0 -42L41 -6L33 2L0 -28L-33 2Z"/>
+            <rect className="door" x="-7" y="6" width="14" height="22" rx="2"/>
+            <rect className={`window ${hour >= 17 || hour < 7 ? 'lit' : ''}`} x="-26" y="2" width="12" height="11" rx="2"/>
+            <rect className={`window ${hour >= 18 || hour < 6 ? 'lit' : ''}`} x="15" y="2" width="12" height="11" rx="2"/>
+            {installed && <g className="battery-pack" transform="translate(28 8)"><rect x="-8" y="-13" width="18" height="29" rx="4"/><rect x="-3" y="-17" width="8" height="4" rx="1"/><path d={`M-4 11V${11 - Math.max(2, (flow.soc / site.capacity) * 19)}H6V11Z`}/><path className="bolt" d="M2 -9L-4 0H1L-2 8L6 -2H1Z"/></g>}
+            {!installed && <circle className="candidate-pulse" cy="-7" r="48"/>}
+            {selected && <g className="site-tag"><rect x="-58" y="-70" width="116" height="22" rx="11"/><text x="0" y="-55" textAnchor="middle">{site.name}</text></g>}
+          </g>
         </g>;
       })}
-      <text x="6" y="101" className="map-label">GRIDVILLE · TRAVIS PRAIRIE DISTRICT</text>
+      <g className="substation" transform="translate(915 410)"><circle r="48"/><path d="M-19 29L0 -30L19 29M-12 6H12M-23 29H23M0 -30V-44"/><circle cy="-49" r="5"/><text x="0" y="67" textAnchor="middle">GRID</text></g>
+      <g className="scene-details"><path d="M69 603q18-25 36 0q-18 18-36 0"/><circle cx="96" cy="585" r="4"/><path d="M195 576q12-19 24 0M204 561l-6-9m12 9l7-8"/></g>
+      {day.zonePriceAdjustments && <g className="zone-labels"><text x="320" y="650">WEST · SOLAR</text><text x="585" y="650">CENTRAL</text><text x="800" y="650">EAST · CONGESTED</text></g>}
     </svg>
-    <div className="map-key"><span><i className="key-house"/>Candidate home</span><span><i className="key-house active"/>Battery placed</span></div>
   </div>;
 }
 
-function SiteEditor({ day, siteId, plan, onPlan }: { day: DayData; siteId: string; plan: PlayerPlan; onPlan: (plan: PlayerPlan) => void }) {
-  const site = day.sites.find((candidate) => candidate.id === siteId)!;
-  const sitePlan = plan[site.id];
-  const setInstalled = (installed: boolean) => onPlan({ ...plan, [site.id]: { installed, actions: installed && !sitePlan.actions.some((a) => a !== 0) ? makeSmartPreset(site, day.prices) : sitePlan.actions } });
-  const setAction = (hour: number, action: Action) => {
-    const actions = [...sitePlan.actions]; actions[hour] = action;
-    onPlan({ ...plan, [site.id]: { ...sitePlan, actions } });
-  };
-  const siteEval = evaluatePlan(day, plan).sites.find((entry) => entry.siteId === site.id)!;
-  return <section className="site-editor card">
-    <div className="site-heading">
-      <div><span className="eyebrow">SELECTED SITE</span><h2>{site.name}</h2><p><MapPin size={14}/>{site.street}</p></div>
-      <button className={`install-toggle ${sitePlan.installed ? 'on' : ''}`} onClick={() => setInstalled(!sitePlan.installed)}>{sitePlan.installed ? <><Check size={16}/> Installed</> : <><BatteryCharging size={16}/> Place battery</>}</button>
-    </div>
-    <div className="spec-row"><span><b>{site.capacity}</b> kWh capacity</span><span><b>{site.power}</b> kW power</span><span><b>{Math.round(site.efficiency * 100)}%</b> round trip</span><span><b>{formatSpark(site.installCost)}</b> install</span></div>
-    {sitePlan.installed ? <>
-      <div className="schedule-title"><div><h3>Paint the dispatch</h3><p>Click a cell to cycle charge → discharge → idle.</p></div><div className="schedule-actions"><button onClick={() => onPlan({ ...plan, [site.id]: { ...sitePlan, actions: makeSmartPreset(site, day.prices) } })}><Sparkles size={14}/> Buy low / sell high</button><button aria-label="Clear schedule" onClick={() => onPlan({ ...plan, [site.id]: { ...sitePlan, actions: Array(24).fill(0) as Action[] } })}><RotateCcw size={14}/></button></div></div>
-      <div className="schedule-grid">{sitePlan.actions.map((action, hour) => { const meta = ACTION_META[action]; const Icon = meta.icon; return <button key={hour} className={`schedule-cell action-${action}`} aria-label={`${hourLabel(hour)}: ${meta.label}`} title={`${hourLabel(hour)} · ${meta.label}`} onClick={() => setAction(hour, action === 0 ? -1 : action === -1 ? 1 : 0)}><span>{hourLabel(hour)}</span><Icon size={15}/><small>{Math.round(siteEval.flows[hour].soc)}</small></button>; })}</div>
-      <div className="schedule-key"><span className="charge"><ArrowDown size={13}/> Charge</span><span className="idle"><X size={13}/> Idle</span><span className="discharge"><ArrowUp size={13}/> Discharge</span><span className="soc-key">number = ending state of charge</span></div>
-      {!siteEval.feasible && <div className="warning"><Info size={16}/> End-of-day charge must return to zero. Add a discharge hour after your final charge.</div>}
-    </> : <div className="editor-empty"><BatteryCharging size={30}/><div><b>No battery here yet</b><p>Place one to unlock its 24-hour dispatch schedule.</p></div></div>}
-  </section>;
+function DayBriefing({ day, onGo }: { day: DayData; onGo: () => void }) {
+  const chapter = chapterFor(day);
+  return <div className="briefing-backdrop"><section className="day-briefing" style={{ '--chapter-color': chapter.color } as CSSProperties}>
+    <div className="broadcast-line"><span className="live-dot"/> GRIDVILLE LIVE · CHAPTER {chapter.number}{day.boss ? ' · BOSS DAY' : ''}</div>
+    <div className="briefing-grid"><div><span className="briefing-kicker">{chapter.title}</span><h1>{day.title}</h1><p className="concept-line"><Zap/> {day.lesson}</p></div><div className="briefing-weather"><CloudSun/><b>{day.weather}</b><span>{day.briefing?.alert}</span></div></div>
+    <div className="news-ticker"><div><small>GRID GOSSIP</small><p>{day.briefing?.gossip}</p></div><div className="rival-call"><div className="rival-avatar">RC</div><div><small>RIVAL DESK · RAE CURRENT</small><p>{day.briefing?.rival}</p></div></div></div>
+    {day.demandResponse && <div className="event-callout"><CloudLightning/><div><b>{day.demandResponse.name} event</b><span>{day.demandResponse.description}</span></div></div>}
+    <button className="briefing-go" onClick={onGo}>Take the controls <ArrowRight/></button>
+  </section></div>;
 }
 
-function GameScreen({ day, plan, setPlan, selectedId, setSelectedId, onDone, solving }: { day: DayData; plan: PlayerPlan; setPlan: (p: PlayerPlan) => void; selectedId: string; setSelectedId: (id: string) => void; onDone: () => void; solving: boolean }) {
+function GameScreen({ day, dayIndex, plan, setPlan, selectedId, setSelectedId, onDone, solving, sfx }: { day: DayData; dayIndex: number; plan: PlayerPlan; setPlan: (plan: PlayerPlan) => void; selectedId: string; setSelectedId: (id: string) => void; onDone: () => void; solving: boolean; sfx: (kind: Sfx) => void }) {
+  const [briefing, setBriefing] = useState(true);
+  const [tool, setTool] = useState<Action>(-1);
+  const [scrubHour, setScrubHour] = useState(12);
+  const [playing, setPlaying] = useState(false);
+  const [locking, setLocking] = useState(false);
+  const [guide, setGuide] = useState<'place' | 'paint' | 'lock' | 'done'>(dayIndex === 0 ? 'place' : 'done');
   const evaluation = evaluatePlan(day, plan);
-  const installedCount = Object.values(plan).filter((site) => site.installed).length;
-  const toggle = (id: string) => {
-    const site = day.sites.find((candidate) => candidate.id === id)!;
-    const current = plan[id];
-    setPlan({ ...plan, [id]: { installed: !current.installed, actions: !current.installed && !current.actions.some((a) => a !== 0) ? makeSmartPreset(site, day.prices) : current.actions } });
+  const selectedSite = day.sites.find((site) => site.id === selectedId) ?? day.sites[0];
+  const selectedPlan = plan[selectedSite.id];
+  const selectedEval = evaluation.sites.find((site) => site.siteId === selectedSite.id)!;
+  const installed = day.sites.filter((site) => plan[site.id]?.installed);
+  const currentFlow = selectedEval.flows[scrubHour] ?? { charge: 0, discharge: 0, soc: 0 };
+  const chapter = chapterFor(day);
+
+  useEffect(() => {
+    if (!playing) return;
+    const timer = window.setInterval(() => setScrubHour((hour) => hour >= 23 ? 0 : hour + 1), 650);
+    return () => window.clearInterval(timer);
+  }, [playing]);
+
+  const chooseSite = (id: string) => {
+    setSelectedId(id);
+    if (!plan[id].installed) {
+      setPlan({ ...plan, [id]: { installed: true, actions: [...plan[id].actions] } });
+      sfx('place');
+      if (guide === 'place') setGuide('paint');
+    } else sfx('click');
   };
-  return <>
-    <main className="game-main">
-      <section className="day-header">
-        <div><div className="round-chip">ROUND {day.round} · DAY {day.dayInRound} OF 3</div><h1>{day.title}</h1><p>{day.lesson}</p></div>
-        <div className="weather"><CloudSun size={20}/><span>{day.weather}</span></div>
+  const paint = (hour: number, action: Action) => {
+    if (!selectedPlan.installed || selectedPlan.actions[hour] === action) return;
+    const actions = [...selectedPlan.actions]; actions[hour] = action;
+    setPlan({ ...plan, [selectedSite.id]: { ...selectedPlan, actions } });
+    sfx('paint');
+    setScrubHour(hour);
+    if (guide === 'paint') setGuide('lock');
+  };
+  const smartPlan = () => {
+    setPlan({ ...plan, [selectedSite.id]: { installed: true, actions: makeSmartPreset(selectedSite, pricesForSite(day, selectedSite)) } });
+    sfx('cash');
+    if (guide === 'paint') setGuide('lock');
+  };
+  const remove = () => {
+    setPlan({ ...plan, [selectedSite.id]: { ...selectedPlan, installed: false } });
+    sfx('thud');
+  };
+  const lock = () => {
+    if (!installed.length || !evaluation.feasible || locking || solving) return;
+    setLocking(true); setGuide('done'); setPlaying(true); sfx('lock');
+    window.setTimeout(() => { setPlaying(false); setScrubHour(23); onDone(); }, 900);
+  };
+
+  return <main className="play-screen" style={{ '--chapter-color': chapter.color } as CSSProperties}>
+    <div className="game-hud"><div><span className="chapter-chip">CH {chapter.number}</span><div><small>{day.boss ? 'BOSS DAY' : `DAY ${day.dayInRound}`} · {chapter.title}</small><h1>{day.title}</h1></div></div><CampaignRail active={chapter.number}/><div className="weather-chip"><CloudSun/><span>{day.weather}</span></div></div>
+    <div className="play-layout">
+      <aside className="left-dock">
+        <div className="dock-title"><span>LIVE FLEET</span><b>{installed.length}/{day.sites.length}</b></div>
+        <p className="mission-copy">{day.lesson}</p>
+        {day.demandResponse && <div className="mini-event"><CloudLightning/><div><b>{day.demandResponse.name}</b><span>Hold stored energy through {hourLabel(day.demandResponse.hour)} for +₷{day.demandResponse.rewardPerStoredKWh}/kWh.</span></div></div>}
+        {day.zonePriceAdjustments && <div className="zone-key"><b>LOCAL PRICES</b><span><i className="west"/>West solar</span><span><i className="central"/>Central</span><span><i className="east"/>East congestion</span></div>}
+        <div className="fleet-list">{day.sites.map((site) => {
+          const siteResult = evaluation.sites.find((entry) => entry.siteId === site.id)!;
+          return <button key={site.id} className={`${selectedId === site.id ? 'selected' : ''} ${plan[site.id].installed ? 'installed' : ''}`} onClick={() => chooseSite(site.id)} title={`${site.capacity} kWh · ${site.power} kW · ${Math.round(site.efficiency * 100)}% efficient · ${formatSpark(site.installCost)} install`}><i style={{ background: site.color }}/><span><b>{site.name}</b><small>{site.zone} · {site.capacity} kWh</small></span>{plan[site.id].installed ? <em className={siteResult.profit >= 0 ? 'positive' : ''}>{formatSpark(siteResult.profit)}</em> : <strong>+</strong>}</button>;
+        })}</div>
+        <div className="gossip-card"><small>RIVAL RADIO</small><p>{day.briefing?.rival}</p><span>— Rae Current</span></div>
+      </aside>
+      <section className="scene-stage">
+        <TownScene day={day} plan={plan} selectedId={selectedId} hour={scrubHour} onSite={chooseSite}/>
+        <div className="sim-strip"><button onClick={() => { setPlaying(!playing); sfx('click'); }} aria-label={playing ? 'Pause day simulation' : 'Play day simulation'}>{playing ? <Square/> : <Play/>}</button><b>{hourLabel(scrubHour)}</b><input aria-label="Time of day" type="range" min="0" max="23" value={scrubHour} onChange={(event) => { setPlaying(false); setScrubHour(Number(event.target.value)); }}/><span>{currentFlow.charge > .01 ? <><ArrowDown/> CHARGING {currentFlow.charge.toFixed(1)} kW</> : currentFlow.discharge > .01 ? <><ArrowUp/> EXPORTING {currentFlow.discharge.toFixed(1)} kW</> : <><FastForward/> FLEET IDLE</>}</span></div>
+        {guide === 'place' && <div className="guide-bubble guide-place"><span>1</span><div><b>Wake up a home</b><p>Click any pulsing house to place your first battery.</p></div></div>}
       </section>
-      {day.round === 2 && <div className="uncertainty-note"><CloudSun size={18}/><div><b>Forecast round</b><span>The pale ribbon is the possible price range. Actual prices appear only after you lock your plan.</span></div></div>}
-      <div className="game-grid">
-        <section className="card map-card"><div className="card-title"><div><span className="eyebrow">STEP 1</span><h2>Choose homes</h2></div><span className="count-pill">{installedCount} placed</span></div><NeighborhoodMap day={day} plan={plan} selectedId={selectedId} onSelect={setSelectedId} onToggle={toggle}/></section>
-        <section className="card prices-card"><div className="card-title"><div><span className="eyebrow">TODAY’S MARKET</span><h2>{day.round === 1 ? 'Day-ahead prices' : 'Price forecast'}</h2></div><Gauge size={21}/></div><PriceChart forecast={day.prices} uncertainty={day.round === 2 ? day.uncertainty : undefined}/></section>
-      </div>
-      <SiteEditor day={day} siteId={selectedId} plan={plan} onPlan={setPlan}/>
-    </main>
-    <footer className="profit-bar">
-      <div className="profit-brand"><CircleDollarSign/><div><small>LIVE PLAN</small><b className={evaluation.profit >= 0 ? 'positive' : 'negative'}>{formatSpark(evaluation.profit)}</b></div></div>
-      <div className="profit-parts"><span><small>Energy sales</small><b>+{formatSpark(evaluation.revenue)}</b></span><span><small>Energy purchases</small><b>−{formatSpark(evaluation.energyCost)}</b></span><span><small>Installations</small><b>−{formatSpark(evaluation.installCost)}</b></span><span><small>Battery wear</small><b>−{formatSpark(evaluation.degradation)}</b></span></div>
-      <button className="done-button" disabled={!installedCount || !evaluation.feasible || solving} onClick={onDone}>{solving ? <><LoaderCircle className="spin"/> Solving…</> : <>Lock plan <ArrowRight/></>}</button>
+      <aside className="dispatch-dock">
+        <div className="site-console"><div className="site-console-head"><i style={{ background: selectedSite.color }}/><div><small>{selectedSite.zone} ZONE · SELECTED</small><h2>{selectedSite.name}</h2><span>{selectedSite.street}</span></div>{selectedPlan.installed ? <button onClick={remove} title="Remove this battery"><X/></button> : null}</div>
+          <div className="stat-chips"><span><b>{selectedSite.capacity}</b> kWh</span><span><b>{selectedSite.power}</b> kW</span><span><b>{Math.round(selectedSite.efficiency * 100)}%</b> eff.</span><span><b>{formatSpark(selectedSite.installCost)}</b> install</span></div>
+        </div>
+        <div className="chart-console">
+          <div className="console-heading"><div><small>PAINT ON THE MARKET</small><b>{day.uncertainty.some(Boolean) ? 'Forecast price' : 'Grid price'} · ₷/kWh</b></div><button onClick={smartPlan} disabled={!selectedPlan.installed} title="Build a strong buy-low / sell-high starting schedule"><WandSparkles/> Smart start</button></div>
+          <PricePainter day={day} site={selectedSite} actions={selectedPlan.actions} flows={selectedEval.flows} tool={tool} scrubHour={scrubHour} disabled={!selectedPlan.installed} onPaint={paint}/>
+          <div className="paint-tools"><button className={tool === -1 ? 'active charge' : ''} onClick={() => { setTool(-1); sfx('click'); }} title="Drag over hours to buy energy and fill the battery"><ArrowDown/><span><b>Charge</b><small>buy energy</small></span></button><button className={tool === 0 ? 'active idle' : ''} onClick={() => { setTool(0); sfx('click'); }} title="Drag to erase charge or discharge actions"><X/><span><b>Idle</b><small>hold energy</small></span></button><button className={tool === 1 ? 'active discharge' : ''} onClick={() => { setTool(1); sfx('click'); }} title="Drag over hours to sell stored energy"><ArrowUp/><span><b>Discharge</b><small>sell energy</small></span></button></div>
+          <div className="soc-console"><div className="soc-copy"><BatteryCharging/><span><small>STATE OF CHARGE · {hourLabel(scrubHour)}</small><b>{currentFlow.soc.toFixed(1)} / {selectedSite.capacity} kWh</b></span></div><div className="soc-track"><i style={{ width: `${Math.min(100, currentFlow.soc / selectedSite.capacity * 100)}%` }}/></div></div>
+          {!selectedEval.feasible && <div className="return-warning"><Lightbulb/><span><b>Bring it home empty.</b> Add discharge after the last charge; every day starts and ends at 0 kWh.</span></div>}
+        </div>
+        {guide === 'paint' && <div className="guide-bubble guide-paint"><span>2</span><div><b>Paint the curve</b><p>Drag blue across cheap hours, then orange across the evening spike.</p></div></div>}
+      </aside>
+    </div>
+    <footer className="live-ledger">
+      <div className="profit-orb" key={Math.round(evaluation.profit)}><CircleDollarSign/><span><small>LIVE PROFIT</small><b className={evaluation.profit >= 0 ? 'positive' : 'negative'}>{formatSpark(evaluation.profit)}</b></span></div>
+      <div className="ledger-parts"><span><small>MARKET SALES</small><b>+{formatSpark(evaluation.revenue)}</b></span>{day.demandResponse && <span className="reserve"><small>FLEX REWARD</small><b>+{formatSpark(evaluation.reserveRevenue)}</b></span>}<span><small>ENERGY BOUGHT</small><b>−{formatSpark(evaluation.energyCost)}</b></span><span><small>HARDWARE + WEAR</small><b>−{formatSpark(evaluation.installCost + evaluation.degradation)}</b></span></div>
+      <button className={`lock-button ${locking ? 'locking' : ''}`} disabled={!installed.length || !evaluation.feasible || solving || locking} onClick={lock}><i/><span>{solving ? <><LoaderCircle className="spin"/> SOLVER WAKING…</> : locking ? <><Zap/> CHARGING DECISION…</> : <><LockKeyhole/> LOCK IT IN</>}</span></button>
+      {guide === 'lock' && evaluation.feasible && <div className="guide-bubble guide-lock"><span>3</span><div><b>Make it count</b><p>Watch the profit react, then lock your plan to face Rae and HiGHS.</p></div></div>}
     </footer>
-  </>;
+    {briefing && <DayBriefing day={day} onGo={() => { setBriefing(false); sfx('click'); }}/>}
+  </main>;
 }
 
-function DispatchStrip({ charge, discharge }: { charge: number[]; discharge: number[] }) {
-  const max = Math.max(1, ...charge, ...discharge);
-  return <div className="dispatch-strip" aria-label="Optimal hourly dispatch">{charge.map((value, hour) => <div key={hour} title={`${hourLabel(hour)} · ${value > .01 ? `charge ${value.toFixed(1)}` : discharge[hour] > .01 ? `discharge ${discharge[hour].toFixed(1)}` : 'idle'} kWh`} className={value > .01 ? 'charge' : discharge[hour] > .01 ? 'discharge' : 'idle'} style={{ '--level': `${Math.max(value, discharge[hour]) / max}` } as React.CSSProperties}/>)}</div>;
+function SolverTown({ day, solver, stage, hidden }: { day: DayData; solver: SolverResult; stage: number; hidden: boolean }) {
+  return <div className={`solver-town stage-${stage} ${hidden ? 'sealed' : ''}`}>
+    <svg viewBox="0 0 700 330" aria-label={hidden ? 'Solver plan sealed for championship mode' : 'Solver battery sites sweeping onto Gridville'}>
+      <defs><linearGradient id="resultSky" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#172748"/><stop offset="1" stopColor="#513653"/></linearGradient></defs>
+      <rect width="700" height="330" fill="url(#resultSky)"/><circle cx="570" cy="61" r="35" className="result-moon"/><path d="M0 190Q120 128 240 190T480 182T700 162V330H0Z" className="result-ground"/><path d="M-20 277Q160 213 350 265T720 230" className="result-road"/>
+      {day.sites.map((site, index) => {
+        const optimal = solver.plans.find((plan) => plan.siteId === site.id);
+        const x = 45 + site.x * 6;
+        const y = 155 + site.y * 1.45;
+        return <g key={site.id} className={`result-house ${optimal?.installed && !hidden ? 'optimal' : ''}`} style={{ '--delay': `${index * 55}ms` } as CSSProperties} transform={`translate(${x} ${y})`}><path d="M-17 0L0 -15L17 0V18H-17Z"/><rect x="-4" y="6" width="8" height="12"/>{optimal?.installed && !hidden && <g className="solver-battery"><rect x="15" y="0" width="10" height="18" rx="2"/><path d="M20 3L17 9H20L18 15L24 8H21Z"/></g>}</g>;
+      })}
+      <g className="solver-sweep"><line x1="0" x2="0" y1="0" y2="330"/><rect width="80" height="330"/></g>
+      {hidden && <g className="sealed-plan"><circle cx="350" cy="162" r="52"/><path d="M329 154V142a21 21 0 0142 0v12M323 154h54v42h-54z"/><text x="350" y="223" textAnchor="middle">CHAMPIONSHIP PLAN SEALED</text></g>}
+    </svg>
+  </div>;
 }
 
-function ResultScreen({ day, plan, solver, actual, onNext, finalDay, championship }: { day: DayData; plan: PlayerPlan; solver: SolverResult; actual: number[]; onNext: () => void; finalDay: boolean; championship: boolean }) {
+function ResultScreen({ day, plan, solver, actual, championship, finalDay, onNext, sfx }: { day: DayData; plan: PlayerPlan; solver: SolverResult; actual: number[]; championship: boolean; finalDay: boolean; onNext: () => void; sfx: (kind: Sfx) => void }) {
+  const [stage, setStage] = useState(0);
   const player = evaluatePlan(day, plan, actual);
   const optimum = evaluateOptimalOnPrices(day, solver, actual);
-  const forecastOptimum = solver.objective;
-  const gap = optimum === 0 ? 100 : Math.round((player.profit / optimum) * 100);
-  const installed = solver.plans.filter((site) => site.installed);
-  return <main className="result-main">
-    <section className="result-hero">
-      <div className="result-kicker"><Sparkles size={16}/> HiGHS found the benchmark in {(solver.solveMs / 1000).toFixed(2)} seconds</div>
-      <h1>{gap >= 95 ? 'That was electric.' : gap >= 70 ? 'A strong dispatch.' : 'The solver found another gear.'}</h1>
-      <p>{day.round === 1 ? 'Your intuition, measured against the true mixed-integer optimum.' : 'Both locked plans were designed from the forecast, then settled against the same actual market.'}</p>
-      <div className="score-compare">
-        <div className="score-card player"><span>YOUR PROFIT</span><strong>{formatSpark(player.profit)}</strong><small>{Object.values(plan).filter((p) => p.installed).length} homes installed</small></div>
-        <div className="gap-medallion"><b>{gap}%</b><span>of benchmark</span></div>
-        <div className="score-card solver"><span>{day.round === 1 ? 'TRUE OPTIMUM' : 'FORECAST BENCHMARK'}</span><strong>{formatSpark(optimum)}</strong><small>{installed.length} homes installed{day.round === 2 ? ` · ${formatSpark(forecastOptimum)} forecast` : ''}</small></div>
+  const percent = performancePercent(player.profit, optimum);
+  const grade = gradeForPercent(percent);
+  const medal = medalForGrade(grade);
+  const suggestion = dispatchSuggestion(day, plan, solver);
+  const chapter = chapterFor(day);
+  const title = grade === 'S' ? 'You bent the curve.' : grade === 'A' ? 'Rae felt that one.' : grade === 'B' ? 'Strong grid instincts.' : grade === 'C' ? 'The town stayed lit.' : 'Doug the battery requests a rematch.';
+  const roast = percent < 50 ? `Rae captured ${100 - percent}% more of the benchmark. She has already printed a tiny victory banner.` : '';
+  useEffect(() => {
+    const solverTimer = window.setTimeout(() => { setStage(1); sfx('cash'); }, 900);
+    const gradeTimer = window.setTimeout(() => { setStage(2); sfx(percent >= 90 ? 'fanfare' : 'thud'); }, 2100);
+    return () => { window.clearTimeout(solverTimer); window.clearTimeout(gradeTimer); };
+  }, [percent, sfx]);
+  return <main className={`reveal-screen reveal-stage-${stage}`} style={{ '--chapter-color': chapter.color } as CSSProperties}>
+    {stage >= 2 && percent >= 90 && <div className="confetti" aria-hidden="true">{Array.from({ length: 72 }, (_, index) => <i key={index} style={{ '--x': `${(index * 47) % 100}vw`, '--delay': `${(index % 12) * -.17}s`, '--color': ['#d7ff63', '#ffd166', '#ff7b63', '#8ee3c8', '#a9b8ff'][index % 5] } as CSSProperties}/>)}</div>}
+    <header className="reveal-header"><div><span>DAY SETTLED · {day.title}</span><b>HiGHS benchmark solved in {(solver.solveMs / 1000).toFixed(2)}s</b></div><CampaignRail active={chapter.number}/></header>
+    <section className="reveal-arena">
+      <div className="reveal-copy"><span className="reveal-kicker">THE MARKET HAS SPOKEN</span><h1>{stage < 2 ? (stage === 0 ? 'Counting your sparks…' : 'The solver enters…') : title}</h1><p>{stage < 2 ? 'Your locked dispatch is settling hour by hour.' : roast || `You captured ${percent}% of the mathematical benchmark with honest battery physics.`}</p>
+        <div className="score-duel"><div className="duel-player"><small>YOUR VPP</small><strong><AnimatedNumber value={player.profit}/></strong><span>{Object.values(plan).filter((site) => site.installed).length} batteries</span></div><div className="versus">VS</div><div className={`duel-solver ${stage >= 1 ? 'shown' : ''}`}><small>{day.uncertainty.some(Boolean) ? 'FORECAST BENCHMARK' : 'HIGHS OPTIMUM'}</small><strong>{stage >= 1 ? <AnimatedNumber value={optimum}/> : '₷???'}</strong><span>{solver.plans.filter((site) => site.installed).length} batteries</span></div></div>
       </div>
+      <div className="solver-visual"><SolverTown day={day} solver={solver} stage={stage} hidden={championship}/><div className="solver-caption"><Sparkles/><span><b>{championship ? 'Plan sealed for the next player' : 'Solver sweep'}</b>{championship ? 'Profit counts; sites stay secret.' : 'Each lime battery is a site HiGHS chose.'}</span></div></div>
+      <div className={`grade-stamp grade-${grade}`}><small>GRIDVILLE GRADE</small><b>{stage >= 2 ? grade : '—'}</b><span>{stage >= 2 ? `${percent}% OF OPTIMAL` : 'CALCULATING'}</span>{stage >= 2 && medal !== 'none' && <em><Medal/> {medal} medal</em>}</div>
     </section>
-    {day.round === 2 && <section className="card result-chart"><div className="card-title"><div><span className="eyebrow">FORECAST CHECK</span><h2>What the market actually did</h2></div></div><PriceChart forecast={day.prices} actual={actual}/></section>}
-    {championship ? <section className="championship-lock card"><Trophy/><div><span className="eyebrow">CHAMPIONSHIP MODE</span><h2>Benchmark plan sealed</h2><p>Your score is settled, but site choices and dispatch are hidden so the next player gets a fair run.</p></div></section> : <section className="solution-card card"><div className="solution-head"><div><span className="eyebrow">SOLVER’S PLAN</span><h2>{installed.length} batteries made the cut</h2><p>Bars below show when the optimized fleet charged and discharged.</p></div><div className="strip-legend"><span className="charge">Charge</span><span className="discharge">Discharge</span></div></div>
-      <div className="solution-list">{installed.map((optimal) => { const site = day.sites.find((s) => s.id === optimal.siteId)!; return <div className="solution-row" key={site.id}><div className="solution-site"><i style={{ background: site.color }}/><div><b>{site.name}</b><small>{site.capacity} kWh · {site.power} kW · {formatSpark(site.installCost)}</small></div></div><DispatchStrip charge={optimal.charge} discharge={optimal.discharge}/></div>; })}</div>
-    </section>}
-    <div className="takeaway"><Lightbulb/><div><b>Dispatch note</b><p>{gap >= 95 ? 'Your site choices and timing nearly matched a globally optimized plan.' : 'The solver prices every extra unit of capacity against installation cost, efficiency loss, and every hourly spread at once.'}</p></div><button className="primary" onClick={onNext}>{finalDay ? <>See match summary <Trophy/></> : <>Next day <ChevronRight/></>}</button></div>
+    {stage >= 2 && <section className="reveal-lessons"><article><Lightbulb/><div><small>ONE MORE THING TO TRY</small><p>{suggestion}</p></div></article><article><Gauge/><div><small>WHAT THE SOLVER SAW · {chapter.shortTitle.toUpperCase()}</small><p>{chapter.fieldGuide}</p></div></article><button onClick={onNext}>{finalDay ? <>Campaign scorecard <Trophy/></> : day.boss ? <>Chapter results <Medal/></> : <>Next dispatch <ChevronRight/></>}</button></section>}
   </main>;
+}
+
+function ChapterSummary({ day, scores, finalChapter, onContinue }: { day: DayData; scores: Score[]; finalChapter: boolean; onContinue: () => void }) {
+  const chapter = chapterFor(day);
+  const chapterScores = scores.filter((score) => score.day.chapterId === day.chapterId);
+  const average = Math.round(chapterScores.reduce((sum, score) => sum + score.percent, 0) / Math.max(1, chapterScores.length));
+  const grade = gradeForPercent(average);
+  return <main className="chapter-summary" style={{ '--chapter-color': chapter.color } as CSSProperties}><CampaignRail active={chapter.number}/><div className="chapter-medal"><Medal/></div><span>CHAPTER {chapter.number} CLEARED</span><h1>{chapter.title}</h1><p>{chapter.concept}</p><div className="chapter-score"><div><small>CHAPTER GRADE</small><b>{grade}</b></div><div><small>BENCHMARK CAPTURED</small><b>{average}%</b></div><div><small>BEST DAY</small><b>{Math.max(...chapterScores.map((score) => score.percent), 0)}%</b></div></div><section className="chapter-recap">{chapterScores.map((score) => <div key={score.day.id}><i className={`medal-${medalForGrade(score.grade)}`}><Medal/></i><span><b>{score.day.title}</b><small>Personal best {score.best}%</small></span><strong>{formatSpark(score.player)}</strong><em>{score.grade}</em></div>)}</section><blockquote><small>FIELD NOTE UNLOCKED</small>“{chapter.fieldGuide}”</blockquote><button onClick={onContinue}>{finalChapter ? <>Build final scorecard <Trophy/></> : <>Enter next chapter <ArrowRight/></>}</button></main>;
+}
+
+function FieldGuide({ progress }: { progress: number }) {
+  return <main className="field-guide"><header><span>GRIDVILLE FIELD GUIDE</span><h1>What the grid taught you.</h1><p>Each chapter turns one optimization idea into something you can see, hear, and play.</p></header><div className="guide-index">{CAMPAIGN_MANIFEST.map((chapter) => {
+    const unlocked = chapter.number <= progress;
+    return <article key={chapter.id} className={unlocked ? 'unlocked' : 'locked'} style={{ '--chapter-color': chapter.color } as CSSProperties}><div className="guide-number">{chapter.number}</div><div><span>{chapter.tier === 'free' ? 'FREE CAMPAIGN' : FOUNDERS_PREVIEW ? 'FOUNDERS PREVIEW' : 'PREMIUM'}</span><h2>{chapter.title}</h2><p>{unlocked ? chapter.fieldGuide : 'Play the previous chapter to decode this field note.'}</p></div><i>{unlocked ? <BookOpen/> : <LockKeyhole/>}</i></article>;
+  })}</div><aside><Sparkles/><div><b>Founders preview is active</b><span>All six playable chapters are unlocked. Progress only gates field-guide notes; there are no payments or accounts.</span></div></aside></main>;
 }
 
 function Welcome({ code, setCode, championship, setChampionship, onStart }: { code: string; setCode: (code: string) => void; championship: boolean; setChampionship: (value: boolean) => void; onStart: () => void }) {
-  return <main className="welcome">
-    <section className="welcome-copy"><div className="town-badge"><BatteryCharging size={17}/> GRIDVILLE VIRTUAL POWER CO.</div><h1>Make the grid<br/><em>work smarter.</em></h1><p>You run a neighborhood battery startup in Gridville, Texas. Pick homes. Plan each hour. Then see how your instinct stacks up against a real optimization solver.</p><div className="welcome-actions"><button className="primary large" onClick={onStart}>Start dispatching <ArrowRight/></button><span>6 days · 2 rounds · No account</span></div></section>
-    <section className="welcome-panel">
-      <div className="sun-disc"/><div className="skyline"><i/><i/><i/><i/><i/></div>
-      <div className="match-card"><div className="match-title"><Users/><div><b>Class match</b><span>Use one code so everyone gets the same days.</span></div></div><label htmlFor="match-code">MATCH CODE</label><input id="match-code" value={code} maxLength={18} onChange={(event) => setCode(event.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, ''))}/><small>Saved only in this browser</small><button className={`championship-toggle ${championship ? 'on' : ''}`} onClick={() => setChampionship(!championship)} role="switch" aria-checked={championship}><span>{championship ? <Check/> : null}</span><div><b>Championship mode</b><small>Hide the solver’s plan between players.</small></div></button></div>
-      <div className="how-stack"><article><span>1</span><div><b>Place</b><small>Choose the best candidate homes.</small></div></article><article><span>2</span><div><b>Dispatch</b><small>Buy low, hold, and sell high.</small></div></article><article><span>3</span><div><b>Compare</b><small>Meet the mathematical optimum.</small></div></article></div>
-    </section>
+  return <main className="welcome-screen"><section className="welcome-world"><div className="welcome-sky"><i className="welcome-sun"/><i className="welcome-cloud one"/><i className="welcome-cloud two"/></div><div className="welcome-town">{Array.from({ length: 9 }, (_, index) => <i key={index} style={{ '--house': index, '--color': ['#ffd166', '#ff9675', '#66d2bd', '#85b8ff'][index % 4] } as CSSProperties}/>)}</div><div className="welcome-lines">{Array.from({ length: 18 }, (_, index) => <i key={index} style={{ '--particle': index } as CSSProperties}/>)}</div><div className="hero-copy"><div className="town-badge"><Zap/> GRIDVILLE VIRTUAL POWER CO.</div><h1>Play the grid.<br/><em>Beat the machine.</em></h1><p>A battery-strategy campaign where every spark moves, every choice pays, and a real optimization solver is waiting at the end of each day.</p><button onClick={onStart}>Start the campaign <ArrowRight/></button><span>9 scenario days · 6 chapters · 1 VPP boss</span></div></section>
+    <aside className="welcome-console"><div className="console-top"><BatteryCharging/><div><small>DISPATCH CONSOLE</small><b>NEW CAMPAIGN</b></div><span>ONLINE</span></div><div className="match-setup"><label htmlFor="match-code">MATCH CODE</label><input id="match-code" value={code} maxLength={18} onChange={(event) => setCode(event.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, ''))}/><small>Same code = same prices, weather surprises, and solver benchmark.</small></div><button className={`championship-switch ${championship ? 'on' : ''}`} role="switch" aria-checked={championship} onClick={() => setChampionship(!championship)}><span>{championship && <Check/>}</span><div><b>Championship mode</b><small>Seal solver site choices between players.</small></div></button><div className="campaign-preview"><div className="preview-heading"><span>CAMPAIGN MAP</span><b>FOUNDERS PREVIEW · ALL OPEN</b></div>{CAMPAIGN_MANIFEST.map((chapter) => <div className="preview-chapter" key={chapter.id}><i style={{ background: chapter.color }}>{chapter.number}</i><span><b>{chapter.title}</b><small>{chapter.concept}</small></span><em>{chapter.tier === 'free' ? 'FREE' : 'PREVIEW'}</em></div>)}</div></aside>
   </main>;
 }
 
-function Learn({ day }: { day: DayData }) {
-  const download = () => {
-    const payload = { currency: 'sparks (₷)', startSocKWh: 0, endSocKWh: 0, degradationCostPerKWh: day.degradationCost, prices: day.prices, uncertainty: day.uncertainty, sites: day.sites };
-    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
-    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `gridville-${day.id}-${day.seed.replace(':', '-').toLowerCase()}.json`; anchor.click(); URL.revokeObjectURL(url);
-  };
-  return <main className="learn-main">
-    <section className="learn-hero"><span className="eyebrow">THE MATH UNDER THE MAP</span><h1>How does the solver know?</h1><p>A battery plan is a stack of linked decisions. Optimization turns every one into a variable, then searches for the combination with the most sparks.</p><button className="primary" onClick={download}><Download/> Download today’s data</button></section>
-    <div className="learn-grid">
-      <section className="card variables"><span className="section-number">01</span><h2>The decisions</h2><div className="variable"><code>x<sub>j</sub></code><p><b>Install or skip.</b> One binary switch for every candidate home <i>j</i>.</p></div><div className="variable"><code>c<sub>jt</sub>, d<sub>jt</sub></code><p><b>Charge and discharge.</b> Continuous energy quantities for home <i>j</i> in hour <i>t</i>.</p></div><div className="variable"><code>s<sub>jt</sub></code><p><b>Stored energy.</b> The battery’s state of charge after each hour.</p></div></section>
-      <section className="card objective"><span className="section-number">02</span><h2>The objective</h2><div className="formula">max&nbsp; Σ<sub>j,t</sub> (p<sub>t</sub>d<sub>jt</sub> − p<sub>t</sub>c<sub>jt</sub> − κ(c<sub>jt</sub>+d<sub>jt</sub>)) − Σ<sub>j</sub> F<sub>j</sub>x<sub>j</sub></div><p>Sell energy, subtract purchases, account for wear <i>κ</i>, and pay each selected home’s fixed installation cost <i>F</i>.</p></section>
-      <section className="card constraints"><span className="section-number">03</span><h2>Keep it physical</h2><ul><li><code>s<sub>jt</sub> = s<sub>j,t−1</sub> + √η<sub>j</sub>c<sub>jt</sub> − d<sub>jt</sub>/√η<sub>j</sub></code><span>Energy carries forward with round-trip losses split across charging and discharging.</span></li><li><code>0 ≤ s<sub>jt</sub> ≤ C<sub>j</sub>x<sub>j</sub></code><span>No battery means no storage; installed batteries cannot exceed capacity.</span></li><li><code>0 ≤ c<sub>jt</sub>, d<sub>jt</sub> ≤ P<sub>j</sub>x<sub>j</sub></code><span>Charging and discharging respect the site’s power rating.</span></li><li><code>s<sub>j,0</sub> = s<sub>j,24</sub> = 0</code><span>Every Gridville day starts and ends empty, so plans cannot borrow energy from tomorrow.</span></li></ul></section>
-      <section className="card branch"><span className="section-number">04</span><h2>Why the binary switches matter</h2><p>If installations could be fractional, the model would be a linear program: a solver can move directly through a continuous landscape. A home battery cannot be 37% installed. Every yes/no choice splits the search.</p><div className="branch-diagram"><div>All plans</div><div><span>Aster: no</span><span>Aster: yes</span></div><div><i>bound</i><i>branch</i><i>best so far</i><i>bound</i></div></div><p>Branch-and-bound explores that decision tree. Linear relaxations give optimistic bounds; any branch that cannot beat the best feasible plan is discarded. This small neighborhood solves quickly, even when it is hard to reason through by hand.</p></section>
-    </div>
-    <aside className="literature-note"><BookOpen/><p>This model shares the fixed-charge structure studied in the general <b>facility-location literature</b>, paired here with a time-linked battery dispatch formulation. Gridville’s story, data, text, and artwork are original.</p></aside>
-  </main>;
-}
-
-function Summary({ scores, code, onRestart }: { scores: Score[]; code: string; onRestart: () => void }) {
+function FinalSummary({ scores, code, onRestart }: { scores: Score[]; code: string; onRestart: () => void }) {
   const totalPlayer = scores.reduce((sum, score) => sum + score.player, 0);
   const totalOptimal = scores.reduce((sum, score) => sum + score.optimal, 0);
-  return <main className="summary-main"><div className="summary-mark"><Trophy/></div><span className="eyebrow">MATCH COMPLETE · {code}</span><h1>Gridville is better balanced.</h1><p className="summary-sub">Six markets, one dispatch desk, and a healthy respect for mixed-integer optimization.</p><div className="summary-total"><div><small>TOTAL PROFIT</small><strong>{formatSpark(totalPlayer)}</strong></div><div><small>BENCHMARK CAPTURED</small><strong>{Math.round(totalPlayer / totalOptimal * 100)}%</strong></div></div><section className="card score-table">{scores.map((score, index) => <div key={score.day.id}><span>0{index + 1}</span><div><b>{score.day.title}</b><small>Round {score.day.round}</small></div><strong>{formatSpark(score.player)}</strong><em>{Math.round(score.player / score.optimal * 100)}%</em></div>)}</section><div className="summary-actions"><button className="primary" onClick={() => window.print()}><Download/> Save scorecard</button><button onClick={onRestart}><RotateCcw/> Play another match</button></div><p className="screenshot-note">Tip: this scorecard is designed to screenshot cleanly.</p></main>;
+  const captured = performancePercent(totalPlayer, totalOptimal);
+  const grade = gradeForPercent(captured);
+  return <main className="final-scorecard"><div className="scorecard-rays"/><div className="final-mark"><Trophy/></div><span>GRIDVILLE CAMPAIGN COMPLETE · {code}</span><h1>Certified grid whisperer.</h1><p>Nine markets. Six optimization ideas. One neighborhood still humming.</p><div className="final-total"><div><small>FINAL GRADE</small><b>{grade}</b></div><div><small>TOTAL PROFIT</small><strong>{formatSpark(totalPlayer)}</strong></div><div><small>OPTIMAL CAPTURED</small><strong>{captured}%</strong></div></div><section className="final-chapters">{CAMPAIGN_MANIFEST.map((chapter) => {
+    const chapterScores = scores.filter((score) => score.day.chapterId === chapter.id);
+    const average = Math.round(chapterScores.reduce((sum, score) => sum + score.percent, 0) / Math.max(1, chapterScores.length));
+    return <div key={chapter.id}><i style={{ background: chapter.color }}>{chapter.number}</i><span><b>{chapter.title}</b><small>{chapter.shortTitle}</small></span><strong>{gradeForPercent(average)}</strong><em>{average}%</em></div>;
+  })}</section><div className="final-actions"><button onClick={() => window.print()}><Sparkles/> Save this scorecard</button><button onClick={onRestart}><RotateCcw/> New match</button></div><small className="screenshot-tip">Built to screenshot. Rae Current would absolutely post hers.</small></main>;
 }
 
 export function App() {
   const [screen, setScreen] = useState<Screen>('welcome');
+  const [lastPlayScreen, setLastPlayScreen] = useState<Screen>('game');
   const [matchCode, setMatchCode] = useState(() => localStorage.getItem('gridville-code') || 'LONE-STAR');
   const [championship, setChampionship] = useState(false);
+  const [muted, setMuted] = useState(() => localStorage.getItem('gridville-muted') === 'true');
+  const [progress, setProgress] = useState(() => Number(localStorage.getItem('gridville-progress') || 1));
   const [dayIndex, setDayIndex] = useState(0);
   const sequence = useMemo(() => buildSequence(matchCode), [matchCode]);
   const day = sequence[dayIndex];
@@ -194,28 +394,57 @@ export function App() {
   const [actual, setActual] = useState<number[]>(day.prices);
   const [solving, setSolving] = useState(false);
   const [scores, setScores] = useState<Score[]>([]);
+  const sfx = useSynth(muted);
 
-  const start = () => { localStorage.setItem('gridville-code', matchCode || 'OPEN-GRID'); setDayIndex(0); const first = buildSequence(matchCode)[0]; setPlan(emptyPlan(first)); setSelectedId(first.sites[0].id); setScores([]); setScreen('game'); };
+  const resetDay = (index: number) => {
+    const nextDay = sequence[index];
+    const chapter = chapterFor(nextDay);
+    if (!isChapterAvailable(chapter)) return;
+    setDayIndex(index); setPlan(emptyPlan(nextDay)); setSelectedId(nextDay.sites[0].id); setSolver(undefined); setActual(nextDay.prices); setScreen('game'); setLastPlayScreen('game');
+    const nextProgress = Math.max(progress, chapter.number); setProgress(nextProgress); localStorage.setItem('gridville-progress', String(nextProgress));
+  };
+  const start = () => {
+    localStorage.setItem('gridville-code', matchCode || 'OPEN-GRID');
+    setScores([]); setProgress(Math.max(1, progress)); resetDay(0); sfx('place');
+  };
   const finish = async () => {
     setSolving(true);
-    try { const result = await solveDay(day); const settled = realizePrices(day); setSolver(result); setActual(settled); setScreen('result'); } catch (error) { console.error(error); window.alert('The solver could not start. Refresh and try this day again.'); } finally { setSolving(false); }
+    try {
+      const result = await solveDay(day);
+      const settled = realizePrices(day);
+      setSolver(result); setActual(settled); setScreen('result'); setLastPlayScreen('result');
+    } catch (error) {
+      console.error(error); window.alert('The solver tripped over a power cord. Your plan is safe—try locking again.');
+    } finally { setSolving(false); }
   };
-  const next = () => {
+  const recordAndAdvance = () => {
     if (!solver) return;
     const playerScore = evaluatePlan(day, plan, actual).profit;
     const optimalScore = evaluateOptimalOnPrices(day, solver, actual);
-    const updatedScores = [...scores, { day, player: playerScore, optimal: optimalScore }];
-    setScores(updatedScores);
-    if (dayIndex === 5) { setScreen('summary'); return; }
-    const nextIndex = dayIndex + 1; const nextDay = sequence[nextIndex]; setDayIndex(nextIndex); setPlan(emptyPlan(nextDay)); setSelectedId(nextDay.sites[0].id); setSolver(undefined); setActual(nextDay.prices); setScreen('game'); window.scrollTo(0, 0);
+    const percent = performancePercent(playerScore, optimalScore);
+    const grade = gradeForPercent(percent);
+    const bestKey = `gridville-best:${matchCode}:${day.id}`;
+    const best = Math.max(percent, Number(localStorage.getItem(bestKey) || 0));
+    localStorage.setItem(bestKey, String(best));
+    setScores((current) => [...current, { day, player: playerScore, optimal: optimalScore, percent, grade, best }]);
+    const nextDay = sequence[dayIndex + 1];
+    if (!nextDay || nextDay.chapterId !== day.chapterId) { setScreen('chapter'); setLastPlayScreen('chapter'); }
+    else resetDay(dayIndex + 1);
   };
+  const continueChapter = () => {
+    if (dayIndex >= sequence.length - 1) { setScreen('summary'); setLastPlayScreen('summary'); }
+    else resetDay(dayIndex + 1);
+  };
+  const goGuide = () => { if (screen !== 'field-guide') setLastPlayScreen(screen); setScreen('field-guide'); };
+  const toggleMute = () => { const next = !muted; setMuted(next); localStorage.setItem('gridville-muted', String(next)); };
 
   return <div className="app-shell">
-    <header className="topbar"><button className="wordmark" onClick={() => setScreen('welcome')} aria-label="Gridville home"><span><BatteryCharging/></span><b>GRIDVILLE</b></button><nav><button className={screen === 'game' || screen === 'result' ? 'active' : ''} onClick={() => screen !== 'welcome' && setScreen('game')}>Dispatch desk</button><button className={screen === 'learn' ? 'active' : ''} onClick={() => setScreen('learn')}>Learn the model</button></nav><div className="desktop-note">BEST ON DESKTOP</div></header>
-    {screen === 'welcome' && <Welcome code={matchCode} setCode={setMatchCode} championship={championship} setChampionship={setChampionship} onStart={start}/>} 
-    {screen === 'game' && <GameScreen day={day} plan={plan} setPlan={setPlan} selectedId={selectedId} setSelectedId={setSelectedId} onDone={finish} solving={solving}/>} 
-    {screen === 'result' && solver && <ResultScreen day={day} plan={plan} solver={solver} actual={actual} onNext={next} finalDay={dayIndex === 5} championship={championship}/>} 
-    {screen === 'learn' && <Learn day={day}/>} 
-    {screen === 'summary' && <Summary scores={scores} code={matchCode} onRestart={() => setScreen('welcome')}/>} 
+    <header className="topbar"><button className="wordmark" onClick={() => setScreen('welcome')}><span><Zap/></span><b>GRIDVILLE</b><em>DISPATCH LAB</em></button><nav>{screen !== 'welcome' && <button onClick={() => setScreen(lastPlayScreen === 'field-guide' ? 'game' : lastPlayScreen)} className={screen !== 'field-guide' ? 'active' : ''}><Gauge/> Dispatch</button>}<button onClick={goGuide} className={screen === 'field-guide' ? 'active' : ''}><BookOpen/> Field guide</button><button onClick={toggleMute} aria-label={muted ? 'Turn sound on' : 'Mute sound'} title={muted ? 'Turn synthesized game sounds on' : 'Mute synthesized game sounds'}>{muted ? <VolumeX/> : <Volume2/>}</button></nav></header>
+    {screen === 'welcome' && <Welcome code={matchCode} setCode={setMatchCode} championship={championship} setChampionship={setChampionship} onStart={start}/>}
+    {screen === 'game' && <GameScreen key={day.id} day={day} dayIndex={dayIndex} plan={plan} setPlan={setPlan} selectedId={selectedId} setSelectedId={setSelectedId} onDone={finish} solving={solving} sfx={sfx}/>}
+    {screen === 'result' && solver && <ResultScreen day={day} plan={plan} solver={solver} actual={actual} championship={championship} finalDay={dayIndex === sequence.length - 1} onNext={recordAndAdvance} sfx={sfx}/>}
+    {screen === 'chapter' && <ChapterSummary day={day} scores={scores} finalChapter={dayIndex === sequence.length - 1} onContinue={continueChapter}/>}
+    {screen === 'field-guide' && <FieldGuide progress={progress}/>}
+    {screen === 'summary' && <FinalSummary scores={scores} code={matchCode} onRestart={() => setScreen('welcome')}/>}
   </div>;
 }

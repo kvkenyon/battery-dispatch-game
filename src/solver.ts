@@ -1,6 +1,7 @@
 import highsLoader from 'highs';
 import wasmUrl from 'highs/runtime?url';
 import type { DayData, OptimalSitePlan, SolverResult } from './types';
+import { pricesForSite } from './logic';
 
 type HighsColumn = { Primal: number };
 type HighsSolution = { Status: string; ObjectiveValue: number; Columns: Record<string, HighsColumn> };
@@ -20,12 +21,14 @@ export function buildLpModel(day: DayData): string {
     binaries.push(x);
     objective.push(term(-site.installCost, x));
     const eta = Math.sqrt(site.efficiency);
+    const sitePrices = pricesForSite(day, site);
     for (let hour = 0; hour < 24; hour += 1) {
       const c = `c_${j}_${hour}`;
       const d = `d_${j}_${hour}`;
       const s = `s_${j}_${hour}`;
-      objective.push(term(-(day.prices[hour] + day.degradationCost), c));
-      objective.push(term(day.prices[hour] - day.degradationCost, d));
+      objective.push(term(-(sitePrices[hour] + day.degradationCost), c));
+      objective.push(term(sitePrices[hour] - day.degradationCost, d));
+      if (day.demandResponse?.hour === hour) objective.push(term(day.demandResponse.rewardPerStoredKWh, s));
       constraints.push(`charge_link_${j}_${hour}: ${c} - ${site.power} ${x} <= 0`);
       constraints.push(`discharge_link_${j}_${hour}: ${d} - ${site.power} ${x} <= 0`);
       constraints.push(`storage_link_${j}_${hour}: ${s} - ${site.capacity} ${x} <= 0`);
@@ -73,7 +76,9 @@ export async function solveDay(day: DayData): Promise<SolverResult> {
 export function evaluateOptimalOnPrices(day: DayData, result: SolverResult, prices: number[]): number {
   return result.plans.reduce((total, plan, j) => {
     if (!plan.installed) return total;
-    const energy = plan.charge.reduce((sum, charge, hour) => sum - charge * prices[hour] - charge * day.degradationCost + plan.discharge[hour] * prices[hour] - plan.discharge[hour] * day.degradationCost, 0);
-    return total + energy - day.sites[j].installCost;
+    const sitePrices = pricesForSite(day, day.sites[j], prices);
+    const energy = plan.charge.reduce((sum, charge, hour) => sum - charge * sitePrices[hour] - charge * day.degradationCost + plan.discharge[hour] * sitePrices[hour] - plan.discharge[hour] * day.degradationCost, 0);
+    const reserve = day.demandResponse ? plan.soc[day.demandResponse.hour] * day.demandResponse.rewardPerStoredKWh : 0;
+    return total + energy + reserve - day.sites[j].installCost;
   }, 0);
 }

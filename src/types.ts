@@ -1,4 +1,24 @@
 export type Action = -1 | 0 | 1;
+export type ContentTier = 'free' | 'premium';
+export type Grade = 'S' | 'A' | 'B' | 'C' | 'D';
+
+export interface ChapterManifest {
+  id: string;
+  number: number;
+  title: string;
+  shortTitle: string;
+  concept: string;
+  fieldGuide: string;
+  tier: ContentTier;
+  color: string;
+}
+
+export interface DemandResponseEvent {
+  name: string;
+  hour: number;
+  rewardPerStoredKWh: number;
+  description: string;
+}
 
 export interface Site {
   id: string;
@@ -11,12 +31,13 @@ export interface Site {
   efficiency: number;
   installCost: number;
   color: string;
+  zone?: string;
 }
 
 export interface DayData {
   id: string;
   title: string;
-  round: 1 | 2;
+  round: number;
   dayInRound: number;
   weather: string;
   lesson: string;
@@ -26,6 +47,17 @@ export interface DayData {
   sites: Site[];
   degradationCost: number;
   seed: string;
+  chapterId?: string;
+  chapterNumber?: number;
+  concept?: string;
+  boss?: boolean;
+  briefing?: {
+    alert: string;
+    gossip: string;
+    rival: string;
+  };
+  zonePriceAdjustments?: Record<string, number[]>;
+  demandResponse?: DemandResponseEvent;
 }
 
 export interface SitePlan {
@@ -45,6 +77,7 @@ export interface SiteEvaluation {
   siteId: string;
   flows: HourFlow[];
   energyRevenue: number;
+  reserveRevenue: number;
   energyCost: number;
   degradation: number;
   installCost: number;
@@ -55,6 +88,7 @@ export interface SiteEvaluation {
 export interface Evaluation {
   sites: SiteEvaluation[];
   revenue: number;
+  reserveRevenue: number;
   energyCost: number;
   installCost: number;
   degradation: number;

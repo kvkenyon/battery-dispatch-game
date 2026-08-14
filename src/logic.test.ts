@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { makeDay, realizePrices, seededRandom } from './data';
-import { emptyPlan, evaluatePlan, evaluateSite, makeSmartPreset } from './logic';
-import { buildLpModel, solveDay } from './solver';
+import { buildSequence, CAMPAIGN_MANIFEST, FOUNDERS_PREVIEW, makeDay, realizePrices, seededRandom } from './data';
+import { emptyPlan, evaluatePlan, evaluateSite, gradeForPercent, makeSmartPreset, medalForGrade, performancePercent, pricesForSite } from './logic';
+import { buildLpModel, evaluateOptimalOnPrices, solveDay } from './solver';
 import type { DayData } from './types';
 
 describe('seeded game data', () => {
@@ -11,6 +11,14 @@ describe('seeded game data', () => {
     expect([a(), a(), a()]).toEqual([b(), b(), b()]);
     expect(makeDay('class-a', 4)).toEqual(makeDay('class-a', 4));
     expect(realizePrices(makeDay('class-a', 4))).toEqual(realizePrices(makeDay('class-a', 4)));
+  });
+
+  it('builds the complete six-chapter founders-preview campaign', () => {
+    const sequence = buildSequence('TEXAS-42');
+    expect(sequence).toHaveLength(9);
+    expect(new Set(sequence.map((day) => day.chapterId)).size).toBe(6);
+    expect(CAMPAIGN_MANIFEST.map((chapter) => chapter.tier)).toEqual(['free', 'free', 'free', 'premium', 'premium', 'premium']);
+    expect(FOUNDERS_PREVIEW).toBe(true);
   });
 });
 
@@ -38,6 +46,32 @@ describe('dispatch accounting', () => {
     const day = makeDay('empty', 0);
     expect(evaluatePlan(day, emptyPlan(day)).profit).toBe(0);
   });
+
+  it('settles zonal prices and a stored-energy demand response reward', () => {
+    const day = makeDay('zones', 7);
+    const site = day.sites.find((candidate) => candidate.zone === 'East')!;
+    const actions = Array(24).fill(0); actions[12] = -1; actions[19] = 1;
+    const plan = emptyPlan(day); plan[site.id] = { installed: true, actions };
+    const sitePrices = pricesForSite(day, site);
+    expect(sitePrices[18]).toBeGreaterThan(day.prices[18]);
+    expect(evaluatePlan(day, plan).sites.find((entry) => entry.siteId === site.id)!.reserveRevenue).toBeGreaterThan(0);
+  });
+});
+
+describe('campaign grading', () => {
+  it('assigns stable performance grades and medals at the published thresholds', () => {
+    expect(performancePercent(90, 100)).toBe(90);
+    expect(performancePercent(-5, 100)).toBe(0);
+    expect(gradeForPercent(98)).toBe('S');
+    expect(gradeForPercent(90)).toBe('A');
+    expect(gradeForPercent(75)).toBe('B');
+    expect(gradeForPercent(60)).toBe('C');
+    expect(gradeForPercent(59)).toBe('D');
+    expect(medalForGrade('S')).toBe('gold');
+    expect(medalForGrade('A')).toBe('silver');
+    expect(medalForGrade('B')).toBe('bronze');
+    expect(medalForGrade('C')).toBe('none');
+  });
 });
 
 describe('HiGHS model', () => {
@@ -59,5 +93,19 @@ describe('HiGHS model', () => {
     expect(solution.status).toBe('Optimal');
     expect(solution.objective).toBeCloseTo(22, 5);
     expect(solution.plans[0].installed).toBe(true);
+  });
+
+  it('keeps demand-response reward and zonal prices in the LP objective', () => {
+    const eventDay = makeDay('lp-event', 7);
+    const model = buildLpModel(eventDay);
+    expect(model).toContain('s_0_18');
+    expect(model).toContain('54.000000 s_0_18');
+    expect(model).toContain('d_10_18');
+  });
+
+  it('settles the zonal demand-response optimum with the same accounting as the LP objective', async () => {
+    const eventDay = makeDay('lp-event', 7);
+    const solution = await solveDay(eventDay);
+    expect(Math.abs(evaluateOptimalOnPrices(eventDay, solution, eventDay.prices) - solution.objective)).toBeLessThan(0.01);
   });
 });
