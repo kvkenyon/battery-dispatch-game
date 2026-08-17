@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { ArrowDown, ArrowRight, ArrowUp, BatteryCharging, BookOpen, Check, ChevronRight, CircleDollarSign, CloudLightning, CloudSun, FastForward, Gauge, Lightbulb, LoaderCircle, LockKeyhole, Medal, Play, RotateCcw, Sparkles, Square, Trophy, Volume2, VolumeX, WandSparkles, X, Zap } from 'lucide-react';
 import { buildSequence, CAMPAIGN_MANIFEST, FOUNDERS_PREVIEW, isChapterAvailable, realizePrices } from './data';
-import { dispatchCallouts, emptyPlan, evaluatePlan, formatSpark, gradeForPercent, hourLabel, makeSmartPreset, medalForGrade, performancePercent, pricesForSite } from './logic';
+import { dispatchCallouts, emptyPlan, evaluatePlan, formatSpark, gradeForPercent, hourLabel, medalForGrade, performancePercent, pricesForSite, smartPresetGuide } from './logic';
 import { evaluateOptimalOnPrices, solveDay } from './solver';
 import type { Action, ChapterManifest, DayData, Grade, PlayerPlan, Site, SolverResult } from './types';
 import { DispatchShowdown, HourlyDispatchBoard } from './DispatchBoard';
+import type { BoardLessonTargets } from './DispatchBoard';
 
 type Screen = 'welcome' | 'game' | 'result' | 'chapter' | 'field-guide' | 'summary';
 type Score = { day: DayData; player: number; optimal: number; percent: number; grade: Grade; best: number };
@@ -152,11 +153,15 @@ function DayBriefing({ day, onGo }: { day: DayData; onGo: () => void }) {
   </section></div>;
 }
 
-function FirstSparkLesson({ day, site, onClose }: { day: DayData; site: Site; onClose: () => void }) {
-  const prices = pricesForSite(day, site);
+function firstSparkTargets(prices: number[]): BoardLessonTargets {
   const peakHour = prices.indexOf(Math.max(...prices));
   const cheapHours = Array.from({ length: peakHour }, (_, hour) => hour).sort((a, b) => prices[a] - prices[b]).slice(0, 2).sort((a, b) => a - b);
-  return <aside className="spark-lesson"><div><span>FIRST SPARK BOARD</span><b>Carry the valley into the spike.</b><p>Start empty. Charge at {cheapHours.map((hour) => `${hourLabel(hour)} (₷${prices[hour].toFixed(1)})`).join(' and ')}, then save it for {hourLabel(peakHour)} (₷{prices[peakHour].toFixed(1)}). End empty.</p></div><button onClick={onClose}>Got it <Check/></button><button className="quiet" onClick={onClose}>Skip</button></aside>;
+  return { cheapHours, peakHour };
+}
+
+function FirstSparkLesson({ day, site, targets, onClose }: { day: DayData; site: Site; targets: BoardLessonTargets; onClose: () => void }) {
+  const prices = pricesForSite(day, site);
+  return <aside className="spark-lesson"><div><span>FIRST SPARK BOARD</span><b>Carry the valley into the spike.</b><p>Follow the CHEAP flags at {targets.cheapHours.map((hour) => `${hourLabel(hour)} (₷${prices[hour].toFixed(1)})`).join(' and ')}, then save it for the SPIKE at {hourLabel(targets.peakHour)} (₷{prices[targets.peakHour].toFixed(1)}). Start and end empty.</p></div><button onClick={onClose}>Got it <Check/></button><button className="quiet" onClick={onClose}>Skip</button></aside>;
 }
 
 function GameScreen({ day, dayIndex, plan, setPlan, selectedId, setSelectedId, onDone, solving, sfx }: { day: DayData; dayIndex: number; plan: PlayerPlan; setPlan: (plan: PlayerPlan) => void; selectedId: string; setSelectedId: (id: string) => void; onDone: () => void; solving: boolean; sfx: (kind: Sfx) => void }) {
@@ -168,6 +173,7 @@ function GameScreen({ day, dayIndex, plan, setPlan, selectedId, setSelectedId, o
   const [guide, setGuide] = useState<'place' | 'paint' | 'lock' | 'done'>(dayIndex === 0 ? 'place' : 'done');
   const [showSparkLesson, setShowSparkLesson] = useState(dayIndex === 0);
   const [raeReaction, setRaeReaction] = useState('Rae: “Pick the tool. The numbers are not hiding anymore.”');
+  const [smartHint, setSmartHint] = useState<string>();
   const evaluation = evaluatePlan(day, plan);
   const selectedSite = day.sites.find((site) => site.id === selectedId) ?? day.sites[0];
   const selectedPlan = plan[selectedSite.id];
@@ -175,6 +181,7 @@ function GameScreen({ day, dayIndex, plan, setPlan, selectedId, setSelectedId, o
   const installed = day.sites.filter((site) => plan[site.id]?.installed);
   const currentFlow = selectedEval.flows[scrubHour] ?? { charge: 0, discharge: 0, soc: 0 };
   const chapter = chapterFor(day);
+  const lessonTargets = useMemo(() => dayIndex === 0 ? firstSparkTargets(pricesForSite(day, selectedSite)) : undefined, [day, dayIndex, selectedSite]);
 
   useEffect(() => {
     if (!playing) return;
@@ -195,13 +202,19 @@ function GameScreen({ day, dayIndex, plan, setPlan, selectedId, setSelectedId, o
     if (!selectedPlan.installed || selectedPlan.actions[hour] === action) return;
     const actions = [...selectedPlan.actions]; actions[hour] = action;
     setPlan({ ...plan, [selectedSite.id]: { ...selectedPlan, actions } });
+    setSmartHint(undefined);
     sfx('paint');
     setScrubHour(hour);
     setRaeReaction(action === -1 ? `Rae: “Buying at ${hourLabel(hour)}. I hope you saw the price.”` : action === 1 ? `Rae: “Selling at ${hourLabel(hour)}. Make the spike proud.”` : `Rae: “${hourLabel(hour)} cleared. Clean slate.”`);
     if (guide === 'paint') setGuide('lock');
   };
   const smartPlan = () => {
-    setPlan({ ...plan, [selectedSite.id]: { installed: true, actions: makeSmartPreset(selectedSite, pricesForSite(day, selectedSite)) } });
+    const prices = pricesForSite(day, selectedSite);
+    const preset = smartPresetGuide(selectedSite, prices);
+    const describe = (hours: number[]) => hours.map((hour) => `${hourLabel(hour)} (₷${prices[hour].toFixed(1)})`).join(', ');
+    setPlan({ ...plan, [selectedSite.id]: { installed: true, actions: preset.actions } });
+    setSmartHint(`Smart start heuristic: buy the cheapest hours before the best spread—${describe(preset.chargeHours)}—then sell the strongest later hours—${describe(preset.dischargeHours)}. Check the labels; it is a worked example, not the answer.`);
+    setRaeReaction('Rae: “Study the highlighted hours. A shortcut only helps if you can explain it.”');
     sfx('cash');
     if (guide === 'paint') setGuide('lock');
   };
@@ -240,8 +253,9 @@ function GameScreen({ day, dayIndex, plan, setPlan, selectedId, setSelectedId, o
         </div>
         <div className="chart-console">
           <div className="console-heading"><div><small>PAINT ON THE MARKET</small><b>{day.uncertainty.some(Boolean) ? 'Forecast price' : 'Grid price'} · ₷/kWh</b></div><button onClick={smartPlan} disabled={!selectedPlan.installed} title="Build a strong buy-low / sell-high starting schedule"><WandSparkles/> Smart start</button></div>
-          {showSparkLesson && <FirstSparkLesson day={day} site={selectedSite} onClose={() => setShowSparkLesson(false)}/>}
-          <HourlyDispatchBoard day={day} site={selectedSite} actions={selectedPlan.actions} flows={selectedEval.flows} tool={tool} scrubHour={scrubHour} disabled={!selectedPlan.installed} onPaint={paint} onInspect={(hour) => { setPlaying(false); setScrubHour(hour); }}/>
+          {showSparkLesson && lessonTargets && <FirstSparkLesson day={day} site={selectedSite} targets={lessonTargets} onClose={() => setShowSparkLesson(false)}/>}
+          <HourlyDispatchBoard day={day} site={selectedSite} actions={selectedPlan.actions} flows={selectedEval.flows} tool={tool} scrubHour={scrubHour} disabled={!selectedPlan.installed} lessonTargets={showSparkLesson ? lessonTargets : undefined} onPaint={paint} onInspect={(hour) => { setPlaying(false); setScrubHour(hour); }}/>
+          {smartHint && <aside className="smart-start-note"><WandSparkles/><span>{smartHint}</span></aside>}
           <div className="paint-tools"><button className={tool === -1 ? 'active charge' : ''} onClick={() => { setTool(-1); sfx('click'); }} title="Drag over hours to buy energy and fill the battery"><ArrowDown/><span><b>Charge</b><small>buy energy</small></span></button><button className={tool === 0 ? 'active idle' : ''} onClick={() => { setTool(0); sfx('click'); }} title="Drag to erase charge or discharge actions"><X/><span><b>Idle</b><small>hold energy</small></span></button><button className={tool === 1 ? 'active discharge' : ''} onClick={() => { setTool(1); sfx('click'); }} title="Drag over hours to sell stored energy"><ArrowUp/><span><b>Discharge</b><small>sell energy</small></span></button></div>
           <p className="rae-reaction">{raeReaction}</p>
           {!selectedEval.feasible && <div className="return-warning"><Lightbulb/><span><b>Bring it home empty.</b> Add discharge after the last charge; every day starts and ends at 0 kWh.</span></div>}
@@ -296,6 +310,7 @@ function ResultScreen({ day, plan, solver, actual, selectedId, championship, fin
   return <main className={`reveal-screen reveal-stage-${stage}`} style={{ '--chapter-color': chapter.color } as CSSProperties}>
     {stage >= 2 && percent >= 90 && <div className="confetti" aria-hidden="true">{Array.from({ length: 72 }, (_, index) => <i key={index} style={{ '--x': `${(index * 47) % 100}vw`, '--delay': `${(index % 12) * -.17}s`, '--color': ['#d7ff63', '#ffd166', '#ff7b63', '#8ee3c8', '#a9b8ff'][index % 5] } as CSSProperties}/>)}</div>}
     <header className="reveal-header"><div><span>DAY SETTLED · {day.title}</span><b>HiGHS benchmark solved in {(solver.solveMs / 1000).toFixed(2)}s</b></div><CampaignRail active={chapter.number}/></header>
+    {stage >= 2 && <DispatchShowdown day={day} site={showdownSite} plan={plan} solver={solver} actual={actual} hidden={championship}/>}
     <section className="reveal-arena">
       <div className="reveal-copy"><span className="reveal-kicker">THE MARKET HAS SPOKEN</span><h1>{stage < 2 ? (stage === 0 ? 'Counting your sparks…' : 'The solver enters…') : title}</h1><p>{stage < 2 ? 'Your locked dispatch is settling hour by hour.' : roast || `You captured ${percent}% of the mathematical benchmark with honest battery physics.`}</p>
         <div className="score-duel"><div className="duel-player"><small>YOUR VPP</small><strong><AnimatedNumber value={player.profit}/></strong><span>{Object.values(plan).filter((site) => site.installed).length} batteries</span></div><div className="versus">VS</div><div className={`duel-solver ${stage >= 1 ? 'shown' : ''}`}><small>{day.uncertainty.some(Boolean) ? 'FORECAST BENCHMARK' : 'HIGHS OPTIMUM'}</small><strong>{stage >= 1 ? <AnimatedNumber value={optimum}/> : '₷???'}</strong><span>{solver.plans.filter((site) => site.installed).length} batteries</span></div></div>
@@ -303,7 +318,6 @@ function ResultScreen({ day, plan, solver, actual, selectedId, championship, fin
       <div className="solver-visual"><SolverTown day={day} solver={solver} stage={stage} hidden={championship}/><div className="solver-caption"><Sparkles/><span><b>{championship ? 'Plan sealed for the next player' : 'Solver sweep'}</b>{championship ? 'Profit counts; sites stay secret.' : 'Each lime battery is a site HiGHS chose.'}</span></div></div>
       <div className={`grade-stamp grade-${grade}`}><small>GRIDVILLE GRADE</small><b>{stage >= 2 ? grade : '—'}</b><span>{stage >= 2 ? `${percent}% OF OPTIMAL` : 'CALCULATING'}</span>{stage >= 2 && medal !== 'none' && <em><Medal/> {medal} medal</em>}</div>
     </section>
-    {stage >= 2 && <DispatchShowdown day={day} site={showdownSite} plan={plan} solver={solver} actual={actual} hidden={championship}/>}
     {stage >= 2 && <section className="reveal-lessons"><article><Lightbulb/><div><small>WHAT THE NUMBERS SAID</small>{callouts.map((callout) => <p key={callout}>{callout}</p>)}</div></article><article><Gauge/><div><small>WHAT THE SOLVER SAW · {chapter.shortTitle.toUpperCase()}</small><p>{chapter.fieldGuide}</p></div></article><button onClick={onNext}>{finalDay ? <>Campaign scorecard <Trophy/></> : day.boss ? <>Chapter results <Medal/></> : <>Next dispatch <ChevronRight/></>}</button></section>}
   </main>;
 }
