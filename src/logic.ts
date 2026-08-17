@@ -1,4 +1,4 @@
-import type { Action, DayData, DemandResponseEvent, Evaluation, Grade, PlayerPlan, Site, SiteEvaluation, SolverResult } from './types';
+import type { Action, DayData, DemandResponseEvent, Evaluation, Grade, OptimalSitePlan, PlayerPlan, Site, SiteEvaluation, SolverResult } from './types';
 
 export const HOURS = Array.from({ length: 24 }, (_, index) => index);
 
@@ -35,6 +35,44 @@ export function makeSmartPreset(site: Site, prices: number[]): Action[] {
 export function pricesForSite(day: DayData, site: Site, basePrices = day.prices): number[] {
   const adjustment = site.zone ? day.zonePriceAdjustments?.[site.zone] : undefined;
   return basePrices.map((price, hour) => price + (adjustment?.[hour] ?? 0));
+}
+
+export function solverActionAt(plan: OptimalSitePlan | undefined, hour: number): Action {
+  const charge = plan?.charge[hour] ?? 0;
+  const discharge = plan?.discharge[hour] ?? 0;
+  if (Math.max(charge, discharge) < .01) return 0;
+  return charge > discharge ? -1 : 1;
+}
+
+export function dispatchCallouts(day: DayData, plan: PlayerPlan, solver: SolverResult, settledPrices = day.prices): string[] {
+  const callouts: string[] = [];
+  const solverOnlySite = day.sites.find((site) => solver.plans.find((candidate) => candidate.siteId === site.id)?.installed && !plan[site.id]?.installed);
+  if (solverOnlySite) callouts.push(`HiGHS added ${solverOnlySite.name}. Its capacity and costs cleared the day’s spread test.`);
+  const playerOnlySite = day.sites.find((site) => plan[site.id]?.installed && !solver.plans.find((candidate) => candidate.siteId === site.id)?.installed);
+  if (playerOnlySite) callouts.push(`You installed ${playerOnlySite.name}; HiGHS sat this one out to protect the fleet’s profit.`);
+  for (const site of day.sites) {
+    const playerPlan = plan[site.id];
+    const solverPlan = solver.plans.find((candidate) => candidate.siteId === site.id);
+    if (!playerPlan?.installed || !solverPlan?.installed) continue;
+    const prices = pricesForSite(day, site, settledPrices);
+    const missedPeak = Array.from({ length: 24 }, (_, hour) => hour)
+      .filter((hour) => solverActionAt(solverPlan, hour) === 1 && playerPlan.actions[hour] !== 1)
+      .sort((a, b) => prices[b] - prices[a])[0];
+    if (missedPeak !== undefined) {
+      callouts.push(`${site.name} missed ${hourLabel(missedPeak)} at ₷${prices[missedPeak].toFixed(1)}. HiGHS exported there; save energy for the spike.`);
+    }
+    const playerCharge = Array.from({ length: 24 }, (_, hour) => hour)
+      .filter((hour) => playerPlan.actions[hour] === -1)
+      .sort((a, b) => prices[b] - prices[a])[0];
+    const solverCharge = Array.from({ length: 24 }, (_, hour) => hour)
+      .filter((hour) => solverActionAt(solverPlan, hour) === -1)
+      .sort((a, b) => prices[a] - prices[b])[0];
+    if (playerCharge !== undefined && solverCharge !== undefined && prices[playerCharge] > prices[solverCharge] + .01) {
+      callouts.push(`${site.name} charged at ${hourLabel(playerCharge)} for ₷${prices[playerCharge].toFixed(1)}. HiGHS bought at ${hourLabel(solverCharge)} for ₷${prices[solverCharge].toFixed(1)}.`);
+    }
+    if (callouts.length >= 3) return callouts.slice(0, 3);
+  }
+  return callouts.length ? callouts : ['Your dispatch stayed close to the solver’s timing. Try a different site mix to test the next spread.'];
 }
 
 export function evaluateSite(site: Site, actions: Action[], prices: number[], degradationCost: number, installed = true, demandResponse?: DemandResponseEvent): SiteEvaluation {
