@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { buildSequence, CAMPAIGN_MANIFEST, FOUNDERS_PREVIEW, makeDay, realizePrices, seededRandom } from './data';
-import { emptyPlan, evaluatePlan, evaluateSite, gradeForPercent, makeSmartPreset, medalForGrade, performancePercent, pricesForSite } from './logic';
+import { dispatchCallouts, emptyPlan, evaluatePlan, evaluateSite, gradeForPercent, makeSmartPreset, medalForGrade, performancePercent, pricesForSite, solverActionAt } from './logic';
 import { buildLpModel, evaluateOptimalOnPrices, solveDay } from './solver';
-import type { DayData } from './types';
+import type { DayData, SolverResult } from './types';
 
 describe('seeded game data', () => {
   it('repeats the same random stream and day', () => {
@@ -71,6 +71,44 @@ describe('campaign grading', () => {
     expect(medalForGrade('A')).toBe('silver');
     expect(medalForGrade('B')).toBe('bronze');
     expect(medalForGrade('C')).toBe('none');
+  });
+});
+
+describe('solver showdown coaching', () => {
+  it('turns the solver flow into actions and names specific timing mistakes', () => {
+    const day = makeDay('showdown', 0);
+    const site = day.sites[0];
+    const plan = emptyPlan(day);
+    plan[site.id] = { installed: true, actions: Array(24).fill(0) };
+    plan[site.id].actions[16] = -1;
+    plan[site.id].actions[17] = 1;
+    const solver: SolverResult = {
+      status: 'Optimal', objective: 0, solveMs: 0,
+      plans: [{
+        siteId: site.id, installed: true,
+        charge: Array.from({ length: 24 }, (_, hour) => hour === 12 ? site.power : 0),
+        discharge: Array.from({ length: 24 }, (_, hour) => hour === 18 ? site.power : 0),
+        soc: Array(24).fill(0),
+      }],
+    };
+    expect(solverActionAt(solver.plans[0], 12)).toBe(-1);
+    expect(solverActionAt(solver.plans[0], 18)).toBe(1);
+    const callouts = dispatchCallouts(day, plan, solver);
+    expect(callouts).toHaveLength(2);
+    expect(callouts[0]).toContain(`missed 6p at ₷${day.prices[18].toFixed(1)}`);
+    expect(callouts[1]).toContain(`charged at 4p for ₷${day.prices[16].toFixed(1)}`);
+    expect(callouts[1]).toContain(`12p for ₷${day.prices[12].toFixed(1)}`);
+  });
+
+  it('calls out a solver-only installation instead of calling disjoint fleets similar', () => {
+    const day = makeDay('site-choice', 1);
+    const plan = emptyPlan(day);
+    plan[day.sites[0].id].installed = true;
+    const solver: SolverResult = {
+      status: 'Optimal', objective: 0, solveMs: 0,
+      plans: [{ siteId: day.sites[1].id, installed: true, charge: Array(24).fill(0), discharge: Array(24).fill(0), soc: Array(24).fill(0) }],
+    };
+    expect(dispatchCallouts(day, plan, solver)[0]).toContain(`HiGHS added ${day.sites[1].name}`);
   });
 });
 
