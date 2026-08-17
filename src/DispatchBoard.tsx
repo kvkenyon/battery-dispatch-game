@@ -4,6 +4,8 @@ import { ArrowDown, ArrowUp, LockKeyhole, Minus } from 'lucide-react';
 import { hourLabel, pricesForSite, solverActionAt } from './logic';
 import type { Action, DayData, HourFlow, PlayerPlan, Site, SolverResult } from './types';
 
+export type BoardLessonTargets = { cheapHours: number[]; peakHour: number };
+
 type DispatchBoardProps = {
   day: DayData;
   site: Site;
@@ -12,6 +14,7 @@ type DispatchBoardProps = {
   tool: Action;
   scrubHour: number;
   disabled: boolean;
+  lessonTargets?: BoardLessonTargets;
   onPaint: (hour: number, action: Action) => void;
   onInspect: (hour: number) => void;
 };
@@ -65,7 +68,7 @@ function hourAt(event: ReactPointerEvent<HTMLDivElement>): number {
   return Math.max(0, Math.min(23, Math.floor((event.clientX - rect.left) / rect.width * 24)));
 }
 
-export function HourlyDispatchBoard({ day, site, actions, flows, tool, scrubHour, disabled, onPaint, onInspect }: DispatchBoardProps) {
+export function HourlyDispatchBoard({ day, site, actions, flows, tool, scrubHour, disabled, lessonTargets, onPaint, onInspect }: DispatchBoardProps) {
   const prices = pricesForSite(day, site);
   const min = Math.min(...prices);
   const max = Math.max(...prices);
@@ -87,12 +90,13 @@ export function HourlyDispatchBoard({ day, site, actions, flows, tool, scrubHour
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
 
-  return <section className={`hourly-dispatch ${disabled ? 'disabled' : ''}`} aria-label={`${site.name} hourly battery dispatch`}>
+  return <section className={`hourly-dispatch ${disabled ? 'disabled' : ''} ${lessonTargets ? 'has-lesson' : ''}`} aria-label={`${site.name} hourly battery dispatch`}>
     <div className="dispatch-readout" aria-live="polite">
       <span>HOUR {hourLabel(visibleHour)}</span><b>₷{prices[visibleHour].toFixed(1)} <small>/ kWh</small></b>
       <em className={actionClass(actions[visibleHour])}><ActionMark action={actions[visibleHour]}/> {actionName(actions[visibleHour])}</em>
       <strong>SOC <i>{flow.soc.toFixed(1)} / {site.capacity} kWh</i></strong>
     </div>
+    {lessonTargets && <div className="lesson-ribbon" aria-hidden="true">{prices.map((_, hour) => <span key={hour} className={lessonTargets.cheapHours.includes(hour) ? 'cheap' : lessonTargets.peakHour === hour ? 'spike' : ''}>{lessonTargets.cheapHours.includes(hour) ? 'CHEAP' : lessonTargets.peakHour === hour ? 'SPIKE' : ''}</span>)}</div>}
     <div className="price-bars" aria-label="Price shape: shorter blue bars are cheaper, taller orange bars are more expensive">
       {prices.map((price, hour) => {
         const height = Math.max(9, ((price - min) / Math.max(1, max - min)) * 100);
@@ -119,13 +123,15 @@ export function HourlyDispatchBoard({ day, site, actions, flows, tool, scrubHour
       {prices.map((price, hour) => {
         const action = actions[hour];
         const event = day.demandResponse?.hour === hour ? day.demandResponse : undefined;
-        return <button key={hour} type="button" disabled={disabled} className={`hour-cell ${actionClass(action)} ${priceTone(price, min, max)} ${hoverHour === hour ? 'hovered' : ''}`}
+        const lessonLabel = lessonTargets?.cheapHours.includes(hour) ? 'CHEAP' : lessonTargets?.peakHour === hour ? 'SPIKE' : undefined;
+        return <button key={hour} type="button" disabled={disabled} className={`hour-cell ${actionClass(action)} ${priceTone(price, min, max)} ${hoverHour === hour ? 'hovered' : ''} ${lessonLabel ? `lesson-${lessonLabel.toLowerCase()}` : ''}`}
           aria-label={`${hourLabel(hour)}, ₷${price.toFixed(1)} per kilowatt-hour, ${actionName(action)}${event ? `, hold for ${event.name}` : ''}`}
           onFocus={() => { setHoverHour(hour); onInspect(hour); }}
           onClick={(event) => { if (event.detail === 0) onPaint(hour, tool); }}>
           <small>{hourLabel(hour)}</small><b>₷{price.toFixed(1)}</b>
           {day.uncertainty[hour] > 0 && <span>±{day.uncertainty[hour].toFixed(0)}</span>}
           <i><ActionMark action={action}/></i>
+          {lessonLabel && <em className="lesson-tag">{lessonLabel}</em>}
           {event && <em>HOLD +₷{event.rewardPerStoredKWh}</em>}
         </button>;
       })}

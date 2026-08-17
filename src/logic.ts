@@ -6,8 +6,8 @@ export function emptyPlan(day: DayData): PlayerPlan {
   return Object.fromEntries(day.sites.map((site) => [site.id, { installed: false, actions: Array(24).fill(0) as Action[] }]));
 }
 
-export function makeSmartPreset(site: Site, prices: number[]): Action[] {
-  const actions = Array(24).fill(0) as Action[];
+export function smartPresetGuide(site: Site, prices: number[]): { actions: Action[]; peakHour: number; chargeHours: number[]; dischargeHours: number[] } {
+  const actions = Array.from({ length: 24 }, (): Action => 0);
   let bestPeak = 1;
   let bestSpread = -Infinity;
   let minBefore = prices[0];
@@ -21,15 +21,19 @@ export function makeSmartPreset(site: Site, prices: number[]): Action[] {
   const eta = Math.sqrt(site.efficiency);
   const chargeHours = Math.ceil(site.capacity / (site.power * eta));
   const dischargeHours = Math.ceil((site.capacity * eta) / site.power);
-  [...Array(bestPeak).keys()]
+  const chargeSchedule = [...Array(bestPeak).keys()]
     .sort((a, b) => prices[a] - prices[b])
-    .slice(0, chargeHours)
-    .forEach((hour) => { actions[hour] = -1; });
-  Array.from({ length: 24 - bestPeak }, (_, i) => i + bestPeak)
+    .slice(0, chargeHours);
+  const dischargeSchedule = Array.from({ length: 24 - bestPeak }, (_, i) => i + bestPeak)
     .sort((a, b) => prices[b] - prices[a])
-    .slice(0, dischargeHours)
-    .forEach((hour) => { actions[hour] = 1; });
-  return actions;
+    .slice(0, dischargeHours);
+  chargeSchedule.forEach((hour) => { actions[hour] = -1; });
+  dischargeSchedule.forEach((hour) => { actions[hour] = 1; });
+  return { actions, peakHour: bestPeak, chargeHours: chargeSchedule, dischargeHours: dischargeSchedule };
+}
+
+export function makeSmartPreset(site: Site, prices: number[]): Action[] {
+  return smartPresetGuide(site, prices).actions;
 }
 
 export function pricesForSite(day: DayData, site: Site, basePrices = day.prices): number[] {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildSequence, CAMPAIGN_MANIFEST, FOUNDERS_PREVIEW, makeDay, realizePrices, seededRandom } from './data';
-import { dispatchCallouts, emptyPlan, evaluatePlan, evaluateSite, gradeForPercent, makeSmartPreset, medalForGrade, performancePercent, pricesForSite, solverActionAt } from './logic';
+import { dispatchCallouts, emptyPlan, evaluatePlan, evaluateSite, gradeForPercent, makeSmartPreset, medalForGrade, performancePercent, pricesForSite, smartPresetGuide, solverActionAt } from './logic';
 import { buildLpModel, evaluateOptimalOnPrices, solveDay } from './solver';
 import type { DayData, SolverResult } from './types';
 
@@ -40,6 +40,16 @@ describe('dispatch accounting', () => {
     const day = makeDay('preset', 0);
     const preset = makeSmartPreset(day.sites[0], day.prices);
     expect(evaluateSite(day.sites[0], preset, day.prices, day.degradationCost, true).feasible).toBe(true);
+  });
+
+  it('explains the exact low-buy and high-sell hours used by Smart start', () => {
+    const day = makeDay('smart-hint', 0);
+    const guide = smartPresetGuide(day.sites[0], day.prices);
+    expect(guide.actions).toEqual(makeSmartPreset(day.sites[0], day.prices));
+    expect(guide.chargeHours.every((hour) => hour < guide.peakHour)).toBe(true);
+    expect(guide.dischargeHours.every((hour) => hour >= guide.peakHour)).toBe(true);
+    expect(guide.chargeHours.every((hour) => guide.actions[hour] === -1)).toBe(true);
+    expect(guide.dischargeHours.every((hour) => guide.actions[hour] === 1)).toBe(true);
   });
 
   it('ignores schedules at homes without an installation', () => {
